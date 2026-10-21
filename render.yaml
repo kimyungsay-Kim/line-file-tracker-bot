@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: line-file-tracker-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: OWNER_USER_ID
+        sync: false
+      - key: DIGEST_HOUR
+        value: "18"
+      - key: DIGEST_MINUTE
+        value: "0"
+      - key: TAG_LOOKBACK_MINUTES
+        value: "30"
+      - key: DB_PATH
+        value: /data/tracker.db
+    disk:
+      name: tracker-db
+      mountPath: /data
+      sizeGB: 1
