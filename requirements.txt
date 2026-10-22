@@ -2,3 +2,4 @@ flask==3.0.3
 line-bot-sdk==3.11.0
 APScheduler==3.10.4
 gunicorn==22.0.0
+tzdata==2024.1

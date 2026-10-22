@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import datetime
+from zoneinfo import ZoneInfo
 
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -100,6 +101,17 @@ def get_group_name(group_id):
     except Exception:
         return group_id
 
+BKK_TZ = ZoneInfo("Asia/Bangkok")
+
+def bkk_now():
+    """Current time in Thailand, regardless of the server's own timezone (Render runs
+    in UTC), returned as a naive datetime whose wall-clock value IS Bangkok time -
+    so it stores/sorts/formats exactly like before, just correct."""
+    return datetime.datetime.now(BKK_TZ).replace(tzinfo=None)
+
+def bkk_today():
+    return bkk_now().date()
+
 def utf16_index_to_py(text, utf16_target):
     """Converts a UTF-16 code-unit offset (as LINE's mention index/length use) into
     a Python string index. Characters outside the Basic Multilingual Plane (such as
@@ -179,7 +191,7 @@ def handle_file(event):
     group_name = get_group_name(group_id)
     msg = event.message
     file_name = getattr(msg, "file_name", None) or msg.type
-    now = datetime.datetime.now()
+    now = bkk_now()
     now_iso = now.isoformat()
     cutoff = (now - datetime.timedelta(minutes=TAG_LOOKBACK_MINUTES)).isoformat()
 
@@ -256,7 +268,7 @@ def handle_text(event):
 
     sender_id = source.user_id
     sender_name = get_profile_name(group_id, sender_id)
-    now = datetime.datetime.now()
+    now = bkk_now()
     now_iso = now.isoformat()
     cutoff = (now - datetime.timedelta(minutes=TAG_LOOKBACK_MINUTES)).isoformat()
 
@@ -310,7 +322,7 @@ def handle_text(event):
 
 # ---------- Summary building ----------
 def build_summary_text(date=None):
-    date = date or datetime.date.today()
+    date = date or bkk_today()
     start = datetime.datetime.combine(date, datetime.time.min).isoformat()
     end = datetime.datetime.combine(date, datetime.time.max).isoformat()
 
@@ -374,6 +386,18 @@ def flex_txt(content, **kwargs):
     d.update(kwargs)
     return d
 
+TIME_COLOR = "#888888"  # timestamps, kept visually distinct from the text next to them
+
+def two_tone_text(main_text, main_color, suffix_text, suffix_color=TIME_COLOR, **kwargs):
+    """A text component with a bold colored main part and a differently-colored
+    suffix (used for "<file name> (<time>)" so the time doesn't blend into the name)."""
+    spans = [{"type": "span", "text": main_text, "color": main_color, "weight": "bold"}]
+    if suffix_text:
+        spans.append({"type": "span", "text": suffix_text, "color": suffix_color})
+    d = {"type": "text", "wrap": True, "contents": spans}
+    d.update(kwargs)
+    return d
+
 def message_text_component(prefix, text_content, mention_spans_json, suffix="", **kwargs):
     """Builds a text component where the @mention substring(s) are colored
     differently (orange, bold) from the rest of the message (blue)."""
@@ -434,7 +458,7 @@ def build_summary_flex(date=None, user_id=None):
     there's nothing to show, in which case alt_text is the plain message to send instead.
     When user_id is given, only shows events where THAT specific person was tagged
     (each admin sees only their own); the downloaded ✅/🔲 status is shared data either way."""
-    date = date or datetime.date.today()
+    date = date or bkk_today()
     start = datetime.datetime.combine(date, datetime.time.min).isoformat()
     end = datetime.datetime.combine(date, datetime.time.max).isoformat()
     date_str = date.strftime('%d/%m/%Y')
@@ -498,8 +522,8 @@ def build_summary_flex(date=None, user_id=None):
                 t = datetime.datetime.fromisoformat(sent_at).strftime("%H:%M")
                 if event_type == "file":
                     mark = "✅" if downloaded else "🔲"
-                    body.append(txt(f"{mark} {file_name}  ({t} น.)",
-                                     weight="bold", size="sm", color=FILE_NAME_COLOR, margin="xs"))
+                    body.append(two_tone_text(f"{mark} {file_name}", FILE_NAME_COLOR, f"  ({t} น.)",
+                                               size="sm", margin="xs"))
                     if downloaded and downloaded_by:
                         body.append(txt(f"   โหลดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
                     if text_content:
@@ -550,7 +574,7 @@ def mark_downloaded(sender_name=None, marked_by_name=None):
         return f"ไม่มีไฟล์ค้างให้ติ๊กครับ{' (ของ ' + sender_name + ')' if sender_name else ''}"
 
     ids = [row[0] for row in pending]
-    now_iso = datetime.datetime.now().isoformat()
+    now_iso = bkk_now().isoformat()
     conn.executemany(
         "UPDATE file_events SET downloaded = 1, downloaded_at = ?, downloaded_by = ? WHERE id = ?",
         [(now_iso, marked_by_name, i) for i in ids]
@@ -584,7 +608,7 @@ def build_overdue_flex():
     """Returns (alt_text, flex_contents_dict) for files tagged on a PREVIOUS day
     that are still not marked downloaded, highlighted in red. Returns (None, None)
     when there's nothing overdue, so the caller can skip sending anything."""
-    today_start = datetime.datetime.combine(datetime.date.today(), datetime.time.min).isoformat()
+    today_start = datetime.datetime.combine(bkk_today(), datetime.time.min).isoformat()
 
     conn = db()
     rows = conn.execute(
@@ -616,8 +640,8 @@ def build_overdue_flex():
             body.append(txt(f"👤 {sender_name}", weight="bold", size="sm", color="#222222", margin="sm"))
             for file_name, text_content, sent_at, mention_spans in items:
                 date_str = datetime.datetime.fromisoformat(sent_at).strftime("%d/%m %H:%M")
-                body.append(txt(f"🔴 {file_name}  ({date_str} น.)",
-                                 weight="bold", size="sm", color=OVERDUE_COLOR, margin="xs"))
+                body.append(two_tone_text(f"🔴 {file_name}", OVERDUE_COLOR, f"  ({date_str} น.)",
+                                           size="sm", margin="xs"))
                 if text_content:
                     body.append(message_text_component(
                         "💬 ", text_content, mention_spans, size="xs", margin="xs"
