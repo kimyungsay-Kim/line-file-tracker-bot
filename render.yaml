@@ -12,6 +12,10 @@ services:
         sync: false
       - key: OWNER_USER_ID
         sync: false
+      - key: TAGGED_USER_IDS
+        sync: false
+      - key: PM_MODE_GROUP_IDS
+        sync: false
       - key: DIGEST_HOUR
         value: "18"
       - key: DIGEST_MINUTE
