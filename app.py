@@ -64,6 +64,7 @@ def db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id TEXT,
             sender_id TEXT,
+            text_content TEXT,
             created_at TEXT
         )
     """)
@@ -141,16 +142,17 @@ def handle_file(event):
     conn = db()
     # was this sender already tagged recently (tag arrived BEFORE the file)?
     pending = conn.execute(
-        "SELECT id FROM pending_tags WHERE group_id = ? AND sender_id = ? AND created_at >= ? LIMIT 1",
+        "SELECT id, text_content FROM pending_tags WHERE group_id = ? AND sender_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
         (group_id, sender_id, cutoff)
     ).fetchone()
     tagged_now = 1 if pending else 0
+    tag_text = pending[1] if pending else None
 
     conn.execute(
         """INSERT INTO file_events
-           (group_id, group_name, sender_id, sender_name, event_type, msg_type, file_name, sent_at, tagged, tagged_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (group_id, group_name, sender_id, sender_name, "file", msg.type, file_name, now_iso,
+           (group_id, group_name, sender_id, sender_name, event_type, msg_type, file_name, text_content, sent_at, tagged, tagged_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (group_id, group_name, sender_id, sender_name, "file", msg.type, file_name, tag_text, now_iso,
          tagged_now, now_iso if tagged_now else None)
     )
     conn.commit()
@@ -214,16 +216,17 @@ def handle_text(event):
             (group_id, group_name, sender_id, sender_name, "pm", "text", text, now_iso, now_iso)
         )
     else:
-        # file mode: match backward to recent un-tagged files from this sender
+        # file mode: match backward to recent un-tagged files from this sender,
+        # and attach this tag's own message text to those files
         cur = conn.execute(
-            """UPDATE file_events SET tagged = 1, tagged_at = ?
+            """UPDATE file_events SET tagged = 1, tagged_at = ?, text_content = ?
                WHERE group_id = ? AND sender_id = ? AND tagged = 0 AND sent_at >= ? AND event_type = 'file'""",
-            (now_iso, group_id, sender_id, cutoff)
+            (now_iso, text, group_id, sender_id, cutoff)
         )
-        # also leave a pending marker in case the file(s) arrive AFTER this tag
+        # also leave a pending marker (with the message text) in case file(s) arrive AFTER this tag
         conn.execute(
-            "INSERT INTO pending_tags (group_id, sender_id, created_at) VALUES (?,?,?)",
-            (group_id, sender_id, now_iso)
+            "INSERT INTO pending_tags (group_id, sender_id, text_content, created_at) VALUES (?,?,?,?)",
+            (group_id, sender_id, text, now_iso)
         )
 
     conn.commit()
@@ -267,6 +270,11 @@ def build_summary_text(date=None):
                 if event_type == "file":
                     mark = "✅" if downloaded else "🔲"
                     lines.append(f"  {mark} {file_name}  ({t} น.)")
+                    if text_content:
+                        preview = text_content.replace("\n", " ")
+                        if len(preview) > 80:
+                            preview = preview[:80] + "..."
+                        lines.append(f"      💬 {preview}")
                 else:
                     preview = (text_content or "").replace("\n", " ")
                     if len(preview) > 60:
