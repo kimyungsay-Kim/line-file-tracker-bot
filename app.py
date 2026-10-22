@@ -57,7 +57,8 @@ def db():
             tagged_at TEXT,
             downloaded INTEGER DEFAULT 0,
             downloaded_at TEXT,
-            mention_spans TEXT
+            mention_spans TEXT,
+            tagged_user_ids TEXT
         )
     """)
     # pending tag markers, for when the tag message arrives BEFORE the file(s)
@@ -68,6 +69,7 @@ def db():
             sender_id TEXT,
             text_content TEXT,
             mention_spans TEXT,
+            tagged_user_ids TEXT,
             created_at TEXT
         )
     """)
@@ -102,15 +104,18 @@ def reply(reply_token, text):
             messages=[TextMessage(text=text)]
         ))
 
-def push_to_owner(text):
-    if not OWNER_USER_ID:
+def push_to(user_id, text):
+    if not user_id:
         return
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.push_message(PushMessageRequest(
-            to=OWNER_USER_ID,
+            to=user_id,
             messages=[TextMessage(text=text)]
         ))
+
+def push_to_owner(text):
+    push_to(OWNER_USER_ID, text)
 
 def reply_flex(reply_token, alt_text, contents_dict):
     with ApiClient(configuration) as api_client:
@@ -120,15 +125,18 @@ def reply_flex(reply_token, alt_text, contents_dict):
             messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict))]
         ))
 
-def push_flex_to_owner(alt_text, contents_dict):
-    if not OWNER_USER_ID:
+def push_flex_to(user_id, alt_text, contents_dict):
+    if not user_id:
         return
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.push_message(PushMessageRequest(
-            to=OWNER_USER_ID,
+            to=user_id,
             messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict))]
         ))
+
+def push_flex_to_owner(alt_text, contents_dict):
+    push_flex_to(OWNER_USER_ID, alt_text, contents_dict)
 
 # ---------- Webhook ----------
 @app.route("/callback", methods=["POST"])
@@ -163,19 +171,20 @@ def handle_file(event):
     conn = db()
     # was this sender already tagged recently (tag arrived BEFORE the file)?
     pending = conn.execute(
-        "SELECT id, text_content, mention_spans FROM pending_tags WHERE group_id = ? AND sender_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT id, text_content, mention_spans, tagged_user_ids FROM pending_tags WHERE group_id = ? AND sender_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
         (group_id, sender_id, cutoff)
     ).fetchone()
     tagged_now = 1 if pending else 0
     tag_text = pending[1] if pending else None
     tag_mention_spans = pending[2] if pending else None
+    tag_user_ids = pending[3] if pending else None
 
     conn.execute(
         """INSERT INTO file_events
-           (group_id, group_name, sender_id, sender_name, event_type, msg_type, file_name, text_content, sent_at, tagged, tagged_at, mention_spans)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+           (group_id, group_name, sender_id, sender_name, event_type, msg_type, file_name, text_content, sent_at, tagged, tagged_at, mention_spans, tagged_user_ids)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (group_id, group_name, sender_id, sender_name, "file", msg.type, file_name, tag_text, now_iso,
-         tagged_now, now_iso if tagged_now else None, tag_mention_spans)
+         tagged_now, now_iso if tagged_now else None, tag_mention_spans, tag_user_ids)
     )
     conn.commit()
     conn.close()
@@ -188,7 +197,7 @@ def handle_text(event):
     # --- 1:1 chat with the owner: on-demand commands ---
     if source.type == "user":
         if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
-            alt_text, contents = build_summary_flex()
+            alt_text, contents = build_summary_flex(user_id=source.user_id)
             if contents is None:
                 reply(event.reply_token, alt_text)
             else:
@@ -240,6 +249,11 @@ def handle_text(event):
             spans.append([idx, length])
     mention_spans_json = json.dumps(spans) if spans else None
 
+    # which tracked person(s) were actually tagged in this message -
+    # each admin's "สรุป" / daily digest only shows events where THEY were tagged
+    tagged_ids = [m.user_id for m in mention.mentionees if getattr(m, "user_id", None) in TAGGED_USER_IDS]
+    tagged_user_ids_json = json.dumps(tagged_ids)
+
     conn = db()
 
     if group_id in PM_MODE_GROUP_IDS:
@@ -247,22 +261,22 @@ def handle_text(event):
         group_name = get_group_name(group_id)
         conn.execute(
             """INSERT INTO file_events
-               (group_id, group_name, sender_id, sender_name, event_type, msg_type, text_content, sent_at, tagged, tagged_at, mention_spans)
-               VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
-            (group_id, group_name, sender_id, sender_name, "pm", "text", text, now_iso, now_iso, mention_spans_json)
+               (group_id, group_name, sender_id, sender_name, event_type, msg_type, text_content, sent_at, tagged, tagged_at, mention_spans, tagged_user_ids)
+               VALUES (?,?,?,?,?,?,?,?,1,?,?,?)""",
+            (group_id, group_name, sender_id, sender_name, "pm", "text", text, now_iso, now_iso, mention_spans_json, tagged_user_ids_json)
         )
     else:
         # file mode: match backward to recent un-tagged files from this sender,
         # and attach this tag's own message text to those files
         cur = conn.execute(
-            """UPDATE file_events SET tagged = 1, tagged_at = ?, text_content = ?, mention_spans = ?
+            """UPDATE file_events SET tagged = 1, tagged_at = ?, text_content = ?, mention_spans = ?, tagged_user_ids = ?
                WHERE group_id = ? AND sender_id = ? AND tagged = 0 AND sent_at >= ? AND event_type = 'file'""",
-            (now_iso, text, mention_spans_json, group_id, sender_id, cutoff)
+            (now_iso, text, mention_spans_json, tagged_user_ids_json, group_id, sender_id, cutoff)
         )
         # also leave a pending marker (with the message text) in case file(s) arrive AFTER this tag
         conn.execute(
-            "INSERT INTO pending_tags (group_id, sender_id, text_content, mention_spans, created_at) VALUES (?,?,?,?,?)",
-            (group_id, sender_id, text, mention_spans_json, now_iso)
+            "INSERT INTO pending_tags (group_id, sender_id, text_content, mention_spans, tagged_user_ids, created_at) VALUES (?,?,?,?,?,?)",
+            (group_id, sender_id, text, mention_spans_json, tagged_user_ids_json, now_iso)
         )
 
     conn.commit()
@@ -323,9 +337,11 @@ def build_summary_text(date=None):
         lines.append("\nพิมพ์ \"โหลดแล้ว\" หรือแค่ \"✅\" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ \"✅ <ชื่อคน>\" เพื่อติ๊กเฉพาะคนนั้น")
     return "\n".join(lines)
 
-def build_summary_flex(date=None):
+def build_summary_flex(date=None, user_id=None):
     """Returns (alt_text, flex_contents_dict). flex_contents_dict is None when
-    there's nothing to show, in which case alt_text is the plain message to send instead."""
+    there's nothing to show, in which case alt_text is the plain message to send instead.
+    When user_id is given, only shows events where THAT specific person was tagged
+    (each admin sees only their own); the downloaded ✅/🔲 status is shared data either way."""
     date = date or datetime.date.today()
     start = datetime.datetime.combine(date, datetime.time.min).isoformat()
     end = datetime.datetime.combine(date, datetime.time.max).isoformat()
@@ -333,18 +349,28 @@ def build_summary_flex(date=None):
 
     conn = db()
     rows = conn.execute(
-        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans
+        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids
            FROM file_events WHERE sent_at BETWEEN ? AND ? AND tagged = 1
            ORDER BY group_name, sender_name, sent_at""",
         (start, end)
     ).fetchall()
     conn.close()
 
+    if user_id:
+        def includes_user(tagged_user_ids_json):
+            if not tagged_user_ids_json:
+                return True  # unknown (older row) - show rather than silently hide
+            try:
+                return user_id in json.loads(tagged_user_ids_json)
+            except (ValueError, TypeError):
+                return True
+        rows = [r for r in rows if includes_user(r[9])]
+
     if not rows:
         return (f"วันที่ {date_str} ยังไม่มีข้อความที่มีคนแท็คคุณครับ", None)
 
     by_group = {}
-    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans in rows:
+    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids in rows:
         by_group.setdefault(group_name, {}).setdefault(sender_name, []).append(
             (event_type, file_name, text_content, sent_at, downloaded, mention_spans)
         )
@@ -507,11 +533,16 @@ def mark_downloaded(sender_name=None):
 
 # ---------- Daily digest ----------
 def send_daily_digest():
-    alt_text, contents = build_summary_flex()
-    if contents is None:
-        push_to_owner(alt_text)
-    else:
-        push_flex_to_owner(alt_text, contents)
+    # each tracked admin gets their own digest, showing only events where THEY were tagged
+    recipients = set(TAGGED_USER_IDS)
+    if OWNER_USER_ID:
+        recipients.add(OWNER_USER_ID)
+    for uid in recipients:
+        alt_text, contents = build_summary_flex(user_id=uid)
+        if contents is None:
+            push_to(uid, alt_text)
+        else:
+            push_flex_to(uid, alt_text, contents)
 
 scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 scheduler.add_job(send_daily_digest, "cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
