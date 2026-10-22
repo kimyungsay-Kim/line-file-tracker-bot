@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import datetime
 
@@ -55,7 +56,8 @@ def db():
             tagged INTEGER DEFAULT 0,
             tagged_at TEXT,
             downloaded INTEGER DEFAULT 0,
-            downloaded_at TEXT
+            downloaded_at TEXT,
+            mention_spans TEXT
         )
     """)
     # pending tag markers, for when the tag message arrives BEFORE the file(s)
@@ -65,6 +67,7 @@ def db():
             group_id TEXT,
             sender_id TEXT,
             text_content TEXT,
+            mention_spans TEXT,
             created_at TEXT
         )
     """)
@@ -160,18 +163,19 @@ def handle_file(event):
     conn = db()
     # was this sender already tagged recently (tag arrived BEFORE the file)?
     pending = conn.execute(
-        "SELECT id, text_content FROM pending_tags WHERE group_id = ? AND sender_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT id, text_content, mention_spans FROM pending_tags WHERE group_id = ? AND sender_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
         (group_id, sender_id, cutoff)
     ).fetchone()
     tagged_now = 1 if pending else 0
     tag_text = pending[1] if pending else None
+    tag_mention_spans = pending[2] if pending else None
 
     conn.execute(
         """INSERT INTO file_events
-           (group_id, group_name, sender_id, sender_name, event_type, msg_type, file_name, text_content, sent_at, tagged, tagged_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+           (group_id, group_name, sender_id, sender_name, event_type, msg_type, file_name, text_content, sent_at, tagged, tagged_at, mention_spans)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (group_id, group_name, sender_id, sender_name, "file", msg.type, file_name, tag_text, now_iso,
-         tagged_now, now_iso if tagged_now else None)
+         tagged_now, now_iso if tagged_now else None, tag_mention_spans)
     )
     conn.commit()
     conn.close()
@@ -226,6 +230,16 @@ def handle_text(event):
     now_iso = now.isoformat()
     cutoff = (now - datetime.timedelta(minutes=TAG_LOOKBACK_MINUTES)).isoformat()
 
+    # capture the character ranges of the @mention(s) within the message text,
+    # so the summary can color the tagged name differently from the rest of the text
+    spans = []
+    for m in mention.mentionees:
+        idx = getattr(m, "index", None)
+        length = getattr(m, "length", None)
+        if idx is not None and length is not None:
+            spans.append([idx, length])
+    mention_spans_json = json.dumps(spans) if spans else None
+
     conn = db()
 
     if group_id in PM_MODE_GROUP_IDS:
@@ -233,22 +247,22 @@ def handle_text(event):
         group_name = get_group_name(group_id)
         conn.execute(
             """INSERT INTO file_events
-               (group_id, group_name, sender_id, sender_name, event_type, msg_type, text_content, sent_at, tagged, tagged_at)
-               VALUES (?,?,?,?,?,?,?,?,1,?)""",
-            (group_id, group_name, sender_id, sender_name, "pm", "text", text, now_iso, now_iso)
+               (group_id, group_name, sender_id, sender_name, event_type, msg_type, text_content, sent_at, tagged, tagged_at, mention_spans)
+               VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
+            (group_id, group_name, sender_id, sender_name, "pm", "text", text, now_iso, now_iso, mention_spans_json)
         )
     else:
         # file mode: match backward to recent un-tagged files from this sender,
         # and attach this tag's own message text to those files
         cur = conn.execute(
-            """UPDATE file_events SET tagged = 1, tagged_at = ?, text_content = ?
+            """UPDATE file_events SET tagged = 1, tagged_at = ?, text_content = ?, mention_spans = ?
                WHERE group_id = ? AND sender_id = ? AND tagged = 0 AND sent_at >= ? AND event_type = 'file'""",
-            (now_iso, text, group_id, sender_id, cutoff)
+            (now_iso, text, mention_spans_json, group_id, sender_id, cutoff)
         )
         # also leave a pending marker (with the message text) in case file(s) arrive AFTER this tag
         conn.execute(
-            "INSERT INTO pending_tags (group_id, sender_id, text_content, created_at) VALUES (?,?,?,?)",
-            (group_id, sender_id, text, now_iso)
+            "INSERT INTO pending_tags (group_id, sender_id, text_content, mention_spans, created_at) VALUES (?,?,?,?,?)",
+            (group_id, sender_id, text, mention_spans_json, now_iso)
         )
 
     conn.commit()
@@ -319,7 +333,7 @@ def build_summary_flex(date=None):
 
     conn = db()
     rows = conn.execute(
-        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded
+        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans
            FROM file_events WHERE sent_at BETWEEN ? AND ? AND tagged = 1
            ORDER BY group_name, sender_name, sent_at""",
         (start, end)
@@ -330,13 +344,72 @@ def build_summary_flex(date=None):
         return (f"วันที่ {date_str} ยังไม่มีข้อความที่มีคนแท็คคุณครับ", None)
 
     by_group = {}
-    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded in rows:
+    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans in rows:
         by_group.setdefault(group_name, {}).setdefault(sender_name, []).append(
-            (event_type, file_name, text_content, sent_at, downloaded)
+            (event_type, file_name, text_content, sent_at, downloaded, mention_spans)
         )
 
     def txt(content, **kwargs):
         d = {"type": "text", "text": content, "wrap": True}
+        d.update(kwargs)
+        return d
+
+    MENTION_COLOR = "#E65100"   # tagged LINE name
+    MESSAGE_COLOR = "#1E88E5"   # the rest of the message text
+    MAX_PREVIEW = 100
+
+    def message_text_component(prefix, text_content, mention_spans_json, suffix="", **kwargs):
+        """Builds a text component where the @mention substring(s) are colored
+        differently (orange, bold) from the rest of the message (blue)."""
+        raw = (text_content or "").replace("\n", " ")
+        spans = []
+        if mention_spans_json:
+            try:
+                spans = json.loads(mention_spans_json)
+            except (ValueError, TypeError):
+                spans = []
+
+        valid = []
+        for s in spans:
+            if isinstance(s, (list, tuple)) and len(s) == 2:
+                idx, length = s
+                if isinstance(idx, int) and isinstance(length, int) and 0 <= idx < len(raw) and length > 0:
+                    valid.append((idx, min(idx + length, len(raw))))
+        valid.sort()
+        merged = []
+        for idx, e in valid:
+            if merged and idx <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((idx, e))
+
+        truncated = False
+        text = raw
+        if len(text) > MAX_PREVIEW:
+            text = text[:MAX_PREVIEW]
+            truncated = True
+            merged = [(i, min(e, MAX_PREVIEW)) for i, e in merged if i < MAX_PREVIEW]
+
+        spans_out = []
+        if prefix:
+            spans_out.append({"type": "span", "text": prefix, "color": MESSAGE_COLOR})
+        if not merged:
+            spans_out.append({"type": "span", "text": text or " ", "color": MESSAGE_COLOR})
+        else:
+            pos = 0
+            for idx, e in merged:
+                if idx > pos:
+                    spans_out.append({"type": "span", "text": text[pos:idx], "color": MESSAGE_COLOR})
+                spans_out.append({"type": "span", "text": text[idx:e], "color": MENTION_COLOR, "weight": "bold"})
+                pos = e
+            if pos < len(text):
+                spans_out.append({"type": "span", "text": text[pos:], "color": MESSAGE_COLOR})
+        if truncated:
+            spans_out.append({"type": "span", "text": "...", "color": MESSAGE_COLOR})
+        if suffix:
+            spans_out.append({"type": "span", "text": suffix, "color": "#888888"})
+
+        d = {"type": "text", "wrap": True, "contents": spans_out}
         d.update(kwargs)
         return d
 
@@ -361,7 +434,7 @@ def build_summary_flex(date=None):
             sender_line = f"👤 {sender_name}{label}"
             body.append(txt(sender_line, weight="bold", size="sm", color="#222222", margin="sm"))
 
-            for event_type, file_name, text_content, sent_at, downloaded in items:
+            for event_type, file_name, text_content, sent_at, downloaded, mention_spans in items:
                 if item_count >= MAX_ITEMS:
                     truncated = True
                     break
@@ -372,15 +445,13 @@ def build_summary_flex(date=None):
                     body.append(txt(f"{mark} {file_name}  ({t} น.)",
                                      weight="bold", size="sm", color="#111111", margin="xs"))
                     if text_content:
-                        preview = text_content.replace("\n", " ")
-                        if len(preview) > 100:
-                            preview = preview[:100] + "..."
-                        body.append(txt(f"💬 {preview}", size="xs", color="#1E88E5", margin="xs"))
+                        body.append(message_text_component(
+                            "💬 ", text_content, mention_spans, size="xs", margin="xs"
+                        ))
                 else:
-                    preview = (text_content or "").replace("\n", " ")
-                    if len(preview) > 100:
-                        preview = preview[:100] + "..."
-                    body.append(txt(f"💬 {preview}  ({t} น.)", size="sm", color="#1E88E5", margin="xs"))
+                    body.append(message_text_component(
+                        "💬 ", text_content, mention_spans, suffix=f"  ({t} น.)", size="sm", margin="xs"
+                    ))
 
     if truncated:
         body.append(txt("… มีรายการเพิ่มเติมที่ไม่ได้แสดงครบ", size="xs", color="#999999", margin="md"))
