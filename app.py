@@ -100,6 +100,17 @@ def get_group_name(group_id):
     except Exception:
         return group_id
 
+def utf16_index_to_py(text, utf16_target):
+    """Converts a UTF-16 code-unit offset (as LINE's mention index/length use) into
+    a Python string index. Characters outside the Basic Multilingual Plane (such as
+    the 🐷 emoji) take 2 UTF-16 units but only 1 Python character."""
+    utf16_pos = 0
+    for py_i, ch in enumerate(text):
+        if utf16_pos >= utf16_target:
+            return py_i
+        utf16_pos += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
 def reply(reply_token, text):
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
@@ -250,13 +261,18 @@ def handle_text(event):
     cutoff = (now - datetime.timedelta(minutes=TAG_LOOKBACK_MINUTES)).isoformat()
 
     # capture the character ranges of the @mention(s) within the message text,
-    # so the summary can color the tagged name differently from the rest of the text
+    # so the summary can color the tagged name differently from the rest of the text.
+    # LINE gives index/length in UTF-16 code units, but Python strings are indexed by
+    # code point, so emoji outside the BMP (like 🐷, which is 2 UTF-16 units but 1
+    # Python character) shift everything after them - convert before storing.
     spans = []
     for m in mention.mentionees:
         idx = getattr(m, "index", None)
         length = getattr(m, "length", None)
         if idx is not None and length is not None:
-            spans.append([idx, length])
+            py_start = utf16_index_to_py(text, idx)
+            py_end = utf16_index_to_py(text, idx + length)
+            spans.append([py_start, py_end - py_start])
     mention_spans_json = json.dumps(spans) if spans else None
 
     # which tracked person(s) were actually tagged in this message -
@@ -348,9 +364,10 @@ def build_summary_text(date=None):
     return "\n".join(lines)
 
 # ---------- Flex building helpers (shared by the daily summary and the overdue digest) ----------
-MENTION_COLOR = "#E65100"   # tagged LINE name
-MESSAGE_COLOR = "#1E88E5"   # the rest of the message text
-MAX_PREVIEW = 100
+MENTION_COLOR = "#1E88E5"   # tagged LINE name (was the message color)
+MESSAGE_COLOR = "#111111"   # the rest of the message text (was the file name color)
+FILE_NAME_COLOR = "#E65100"  # file name (was the tagged-name color)
+MAX_PREVIEW = 500
 
 def flex_txt(content, **kwargs):
     d = {"type": "text", "text": content, "wrap": True}
@@ -482,7 +499,7 @@ def build_summary_flex(date=None, user_id=None):
                 if event_type == "file":
                     mark = "✅" if downloaded else "🔲"
                     body.append(txt(f"{mark} {file_name}  ({t} น.)",
-                                     weight="bold", size="sm", color="#111111", margin="xs"))
+                                     weight="bold", size="sm", color=FILE_NAME_COLOR, margin="xs"))
                     if downloaded and downloaded_by:
                         body.append(txt(f"   โหลดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
                     if text_content:
