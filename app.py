@@ -7,7 +7,7 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest,
-    PushMessageRequest, TextMessage
+    PushMessageRequest, TextMessage, FlexMessage, FlexContainer
 )
 from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent, ImageMessageContent,
@@ -109,6 +109,24 @@ def push_to_owner(text):
             messages=[TextMessage(text=text)]
         ))
 
+def reply_flex(reply_token, alt_text, contents_dict):
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict))]
+        ))
+
+def push_flex_to_owner(alt_text, contents_dict):
+    if not OWNER_USER_ID:
+        return
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.push_message(PushMessageRequest(
+            to=OWNER_USER_ID,
+            messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict))]
+        ))
+
 # ---------- Webhook ----------
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -166,7 +184,11 @@ def handle_text(event):
     # --- 1:1 chat with the owner: on-demand commands ---
     if source.type == "user":
         if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
-            reply(event.reply_token, build_summary_text())
+            alt_text, contents = build_summary_flex()
+            if contents is None:
+                reply(event.reply_token, alt_text)
+            else:
+                reply_flex(event.reply_token, alt_text, contents)
         elif text in ("id", "whoami", "ไอดี"):
             reply(event.reply_token, f"user_id ของคุณคือ:\n{source.user_id}")
         elif text in ("โหลดแล้ว", "✅", "👍"):
@@ -287,6 +309,101 @@ def build_summary_text(date=None):
         lines.append("\nพิมพ์ \"โหลดแล้ว\" หรือแค่ \"✅\" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ \"✅ <ชื่อคน>\" เพื่อติ๊กเฉพาะคนนั้น")
     return "\n".join(lines)
 
+def build_summary_flex(date=None):
+    """Returns (alt_text, flex_contents_dict). flex_contents_dict is None when
+    there's nothing to show, in which case alt_text is the plain message to send instead."""
+    date = date or datetime.date.today()
+    start = datetime.datetime.combine(date, datetime.time.min).isoformat()
+    end = datetime.datetime.combine(date, datetime.time.max).isoformat()
+    date_str = date.strftime('%d/%m/%Y')
+
+    conn = db()
+    rows = conn.execute(
+        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded
+           FROM file_events WHERE sent_at BETWEEN ? AND ? AND tagged = 1
+           ORDER BY group_name, sender_name, sent_at""",
+        (start, end)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return (f"วันที่ {date_str} ยังไม่มีข้อความที่มีคนแท็คคุณครับ", None)
+
+    by_group = {}
+    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded in rows:
+        by_group.setdefault(group_name, {}).setdefault(sender_name, []).append(
+            (event_type, file_name, text_content, sent_at, downloaded)
+        )
+
+    def txt(content, **kwargs):
+        d = {"type": "text", "text": content, "wrap": True}
+        d.update(kwargs)
+        return d
+
+    body = [txt(f"📋 สรุปรายการที่แท็คคุณ", weight="bold", size="lg", color="#111111")]
+    body.append(txt(date_str, size="sm", color="#888888", margin="xs"))
+    body.append({"type": "separator", "margin": "md"})
+
+    pending_total = 0
+    item_count = 0
+    MAX_ITEMS = 60  # safety cap so the flex message doesn't blow past LINE's size limit
+    truncated = False
+
+    for group_name, by_sender in by_group.items():
+        body.append(txt(f"📁 {group_name}", weight="bold", size="md", color="#0B6E4F", margin="lg"))
+        for sender_name, items in by_sender.items():
+            if item_count >= MAX_ITEMS:
+                truncated = True
+                break
+            pending_count = sum(1 for e, _, _, _, d in items if e == "file" and not d)
+            pending_total += pending_count
+            label = f"  (ยังไม่โหลด {pending_count})" if any(e == "file" for e, *_ in items) else ""
+            sender_line = f"👤 {sender_name}{label}"
+            body.append(txt(sender_line, weight="bold", size="sm", color="#222222", margin="sm"))
+
+            for event_type, file_name, text_content, sent_at, downloaded in items:
+                if item_count >= MAX_ITEMS:
+                    truncated = True
+                    break
+                item_count += 1
+                t = datetime.datetime.fromisoformat(sent_at).strftime("%H:%M")
+                if event_type == "file":
+                    mark = "✅" if downloaded else "🔲"
+                    body.append(txt(f"{mark} {file_name}  ({t} น.)",
+                                     weight="bold", size="sm", color="#111111", margin="xs"))
+                    if text_content:
+                        preview = text_content.replace("\n", " ")
+                        if len(preview) > 100:
+                            preview = preview[:100] + "..."
+                        body.append(txt(f"💬 {preview}", size="xs", color="#1E88E5", margin="xs"))
+                else:
+                    preview = (text_content or "").replace("\n", " ")
+                    if len(preview) > 100:
+                        preview = preview[:100] + "..."
+                    body.append(txt(f"💬 {preview}  ({t} น.)", size="sm", color="#1E88E5", margin="xs"))
+
+    if truncated:
+        body.append(txt("… มีรายการเพิ่มเติมที่ไม่ได้แสดงครบ", size="xs", color="#999999", margin="md"))
+
+    body.append({"type": "separator", "margin": "lg"})
+    if pending_total == 0:
+        body.append(txt("ไฟล์งานโหลดครบแล้วครับ 🎉", size="sm", color="#0B6E4F", margin="md"))
+    else:
+        body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ "✅ <ชื่อคน>" เพื่อติ๊กเฉพาะคนนั้น',
+                         size="xs", color="#888888", margin="md"))
+
+    contents = {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "xs",
+            "contents": body
+        }
+    }
+    alt_text = f"สรุปรายการที่แท็คคุณ วันที่ {date_str} ({item_count} รายการ)"
+    return (alt_text, contents)
+
 def mark_downloaded(sender_name=None):
     conn = db()
     if sender_name:
@@ -310,7 +427,11 @@ def mark_downloaded(sender_name=None):
 
 # ---------- Daily digest ----------
 def send_daily_digest():
-    push_to_owner(build_summary_text())
+    alt_text, contents = build_summary_flex()
+    if contents is None:
+        push_to_owner(alt_text)
+    else:
+        push_flex_to_owner(alt_text, contents)
 
 scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 scheduler.add_job(send_daily_digest, "cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
