@@ -57,6 +57,7 @@ def db():
             tagged_at TEXT,
             downloaded INTEGER DEFAULT 0,
             downloaded_at TEXT,
+            downloaded_by TEXT,
             mention_spans TEXT,
             tagged_user_ids TEXT
         )
@@ -197,7 +198,9 @@ def handle_text(event):
     # --- 1:1 chat with the owner: on-demand commands ---
     if source.type == "user":
         if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
-            alt_text, contents = build_summary_flex(user_id=source.user_id)
+            # shared summary: everyone tracked sees the same tagged events,
+            # regardless of who specifically got tagged
+            alt_text, contents = build_summary_flex()
             if contents is None:
                 reply(event.reply_token, alt_text)
             else:
@@ -205,11 +208,15 @@ def handle_text(event):
         elif text in ("id", "whoami", "ไอดี"):
             reply(event.reply_token, f"user_id ของคุณคือ:\n{source.user_id}")
         elif text in ("โหลดแล้ว", "✅", "👍"):
-            reply(event.reply_token, mark_downloaded())
+            reply(event.reply_token, mark_downloaded(marked_by_name=get_profile_name(None, source.user_id)))
         elif text.startswith("โหลดแล้ว "):
-            reply(event.reply_token, mark_downloaded(text[len("โหลดแล้ว "):].strip()))
+            reply(event.reply_token, mark_downloaded(
+                text[len("โหลดแล้ว "):].strip(), marked_by_name=get_profile_name(None, source.user_id)
+            ))
         elif text.startswith("✅ ") or text.startswith("👍 "):
-            reply(event.reply_token, mark_downloaded(text[2:].strip()))
+            reply(event.reply_token, mark_downloaded(
+                text[2:].strip(), marked_by_name=get_profile_name(None, source.user_id)
+            ))
         return
 
     if source.type != "group":
@@ -349,7 +356,7 @@ def build_summary_flex(date=None, user_id=None):
 
     conn = db()
     rows = conn.execute(
-        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids
+        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids, downloaded_by
            FROM file_events WHERE sent_at BETWEEN ? AND ? AND tagged = 1
            ORDER BY group_name, sender_name, sent_at""",
         (start, end)
@@ -370,9 +377,9 @@ def build_summary_flex(date=None, user_id=None):
         return (f"วันที่ {date_str} ยังไม่มีข้อความที่มีคนแท็คคุณครับ", None)
 
     by_group = {}
-    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids in rows:
+    for group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids, downloaded_by in rows:
         by_group.setdefault(group_name, {}).setdefault(sender_name, []).append(
-            (event_type, file_name, text_content, sent_at, downloaded, mention_spans)
+            (event_type, file_name, text_content, sent_at, downloaded, mention_spans, downloaded_by)
         )
 
     def txt(content, **kwargs):
@@ -460,7 +467,7 @@ def build_summary_flex(date=None, user_id=None):
             sender_line = f"👤 {sender_name}{label}"
             body.append(txt(sender_line, weight="bold", size="sm", color="#222222", margin="sm"))
 
-            for event_type, file_name, text_content, sent_at, downloaded, mention_spans in items:
+            for event_type, file_name, text_content, sent_at, downloaded, mention_spans, downloaded_by in items:
                 if item_count >= MAX_ITEMS:
                     truncated = True
                     break
@@ -470,6 +477,8 @@ def build_summary_flex(date=None, user_id=None):
                     mark = "✅" if downloaded else "🔲"
                     body.append(txt(f"{mark} {file_name}  ({t} น.)",
                                      weight="bold", size="sm", color="#111111", margin="xs"))
+                    if downloaded and downloaded_by:
+                        body.append(txt(f"   โหลดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
                     if text_content:
                         body.append(message_text_component(
                             "💬 ", text_content, mention_spans, size="xs", margin="xs"
@@ -501,7 +510,7 @@ def build_summary_flex(date=None, user_id=None):
     alt_text = f"สรุปรายการที่แท็คคุณ วันที่ {date_str} ({item_count} รายการ)"
     return (alt_text, contents)
 
-def mark_downloaded(sender_name=None):
+def mark_downloaded(sender_name=None, marked_by_name=None):
     conn = db()
     if sender_name:
         pending = conn.execute(
@@ -518,9 +527,10 @@ def mark_downloaded(sender_name=None):
         return f"ไม่มีไฟล์ค้างให้ติ๊กครับ{' (ของ ' + sender_name + ')' if sender_name else ''}"
 
     ids = [row[0] for row in pending]
+    now_iso = datetime.datetime.now().isoformat()
     conn.executemany(
-        "UPDATE file_events SET downloaded = 1, downloaded_at = ? WHERE id = ?",
-        [(datetime.datetime.now().isoformat(), i) for i in ids]
+        "UPDATE file_events SET downloaded = 1, downloaded_at = ?, downloaded_by = ? WHERE id = ?",
+        [(now_iso, marked_by_name, i) for i in ids]
     )
     conn.commit()
     conn.close()
@@ -533,12 +543,12 @@ def mark_downloaded(sender_name=None):
 
 # ---------- Daily digest ----------
 def send_daily_digest():
-    # each tracked admin gets their own digest, showing only events where THEY were tagged
+    # shared digest: every tracked admin gets the same full summary
+    alt_text, contents = build_summary_flex()
     recipients = set(TAGGED_USER_IDS)
     if OWNER_USER_ID:
         recipients.add(OWNER_USER_ID)
     for uid in recipients:
-        alt_text, contents = build_summary_flex(user_id=uid)
         if contents is None:
             push_to(uid, alt_text)
         else:
