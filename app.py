@@ -167,10 +167,12 @@ def handle_text(event):
             reply(event.reply_token, build_summary_text())
         elif text in ("id", "whoami", "ไอดี"):
             reply(event.reply_token, f"user_id ของคุณคือ:\n{source.user_id}")
-        elif text == "โหลดแล้ว":
+        elif text in ("โหลดแล้ว", "✅", "👍"):
             reply(event.reply_token, mark_downloaded())
         elif text.startswith("โหลดแล้ว "):
             reply(event.reply_token, mark_downloaded(text[len("โหลดแล้ว "):].strip()))
+        elif text.startswith("✅ ") or text.startswith("👍 "):
+            reply(event.reply_token, mark_downloaded(text[2:].strip()))
         return
 
     if source.type != "group":
@@ -274,7 +276,7 @@ def build_summary_text(date=None):
     if pending_total == 0:
         lines.append("\nไฟล์งานโหลดครบแล้วครับ 🎉")
     else:
-        lines.append(f"\nพิมพ์ \"โหลดแล้ว\" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ \"โหลดแล้ว <ชื่อคน>\" เพื่อติ๊กเฉพาะคนนั้น")
+        lines.append("\nพิมพ์ \"โหลดแล้ว\" หรือแค่ \"✅\" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ \"✅ <ชื่อคน>\" เพื่อติ๊กเฉพาะคนนั้น")
     return "\n".join(lines)
 
 def mark_downloaded(sender_name=None):
