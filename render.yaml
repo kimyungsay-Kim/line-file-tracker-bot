@@ -26,5 +26,7 @@ services:
         value: "0"
       - key: TAG_LOOKBACK_MINUTES
         value: "30"
-      - key: DB_PATH
-        value: tracker.db
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false

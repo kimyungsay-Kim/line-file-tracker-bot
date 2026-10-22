@@ -1,8 +1,9 @@
 import os
 import json
-import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
+
+import libsql_client
 
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -36,49 +37,100 @@ DIGEST_MINUTE = int(os.environ.get("DIGEST_MINUTE", "0"))
 OVERDUE_HOUR = int(os.environ.get("OVERDUE_HOUR", "8"))    # morning check for files left over from before today
 OVERDUE_MINUTE = int(os.environ.get("OVERDUE_MINUTE", "0"))
 TAG_LOOKBACK_MINUTES = int(os.environ.get("TAG_LOOKBACK_MINUTES", "30"))
-DB_PATH = os.environ.get("DB_PATH", "tracker.db")
+
+# Turso (hosted libSQL/SQLite) - persistent storage, survives redeploys unlike a local
+# sqlite file on Render's free tier (which has no disk and resets on every deploy).
+TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
+TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
 
 app = Flask(__name__)
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
 # ---------- Storage ----------
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS file_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT,
-            group_name TEXT,
-            sender_id TEXT,
-            sender_name TEXT,
-            event_type TEXT,      -- 'file' or 'pm'
-            msg_type TEXT,
-            file_name TEXT,
-            text_content TEXT,
-            sent_at TEXT,
-            tagged INTEGER DEFAULT 0,
-            tagged_at TEXT,
-            downloaded INTEGER DEFAULT 0,
-            downloaded_at TEXT,
-            downloaded_by TEXT,
-            mention_spans TEXT,
-            tagged_user_ids TEXT
-        )
-    """)
+SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS file_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT,
+        group_name TEXT,
+        sender_id TEXT,
+        sender_name TEXT,
+        event_type TEXT,      -- 'file' or 'pm'
+        msg_type TEXT,
+        file_name TEXT,
+        text_content TEXT,
+        sent_at TEXT,
+        tagged INTEGER DEFAULT 0,
+        tagged_at TEXT,
+        downloaded INTEGER DEFAULT 0,
+        downloaded_at TEXT,
+        downloaded_by TEXT,
+        mention_spans TEXT,
+        tagged_user_ids TEXT
+    )
+    """,
     # pending tag markers, for when the tag message arrives BEFORE the file(s)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pending_tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT,
-            sender_id TEXT,
-            text_content TEXT,
-            mention_spans TEXT,
-            tagged_user_ids TEXT,
-            created_at TEXT
-        )
-    """)
-    return conn
+    """
+    CREATE TABLE IF NOT EXISTS pending_tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT,
+        sender_id TEXT,
+        text_content TEXT,
+        mention_spans TEXT,
+        tagged_user_ids TEXT,
+        created_at TEXT
+    )
+    """,
+]
+
+class _FetchResult:
+    """Makes a libsql_client ResultSet behave like a sqlite3 cursor for the
+    .fetchall()/.fetchone() calls used throughout this file."""
+    def __init__(self, rows):
+        self._rows = [tuple(r) for r in rows]
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+class _LibsqlConn:
+    """Thin adapter so the rest of the app can keep using the sqlite3-style
+    conn.execute(sql, params).fetchall()/.fetchone(), conn.executemany(...),
+    conn.commit(), conn.close() calls against a Turso (libSQL) database."""
+    def __init__(self, client):
+        self._client = client
+
+    def execute(self, sql, params=()):
+        rs = self._client.execute(sql, list(params))
+        return _FetchResult(rs.rows)
+
+    def executemany(self, sql, seq_of_params):
+        stmts = [libsql_client.Statement(sql, list(p)) for p in seq_of_params]
+        if stmts:
+            self._client.batch(stmts)
+
+    def commit(self):
+        pass  # each statement over the Turso HTTP API is already committed
+
+    def close(self):
+        self._client.close()
+
+def db():
+    client = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    return _LibsqlConn(client)
+
+def init_db_schema():
+    client = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    try:
+        for stmt in SCHEMA_STATEMENTS:
+            client.execute(stmt)
+    finally:
+        client.close()
+
+init_db_schema()
 
 def get_profile_name(group_id, user_id):
     try:
