@@ -23,8 +23,4 @@ services:
       - key: TAG_LOOKBACK_MINUTES
         value: "30"
       - key: DB_PATH
-        value: /data/tracker.db
-    disk:
-      name: tracker-db
-      mountPath: /data
-      sizeGB: 1
+        value: tracker.db
