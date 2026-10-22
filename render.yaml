@@ -20,6 +20,10 @@ services:
         value: "18"
       - key: DIGEST_MINUTE
         value: "0"
+      - key: OVERDUE_HOUR
+        value: "8"
+      - key: OVERDUE_MINUTE
+        value: "0"
       - key: TAG_LOOKBACK_MINUTES
         value: "30"
       - key: DB_PATH

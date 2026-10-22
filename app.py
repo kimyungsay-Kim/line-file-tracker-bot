@@ -31,6 +31,9 @@ PM_MODE_GROUP_IDS = set(x.strip() for x in os.environ.get("PM_MODE_GROUP_IDS", "
 
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "18"))   # 24h, Asia/Bangkok
 DIGEST_MINUTE = int(os.environ.get("DIGEST_MINUTE", "0"))
+
+OVERDUE_HOUR = int(os.environ.get("OVERDUE_HOUR", "8"))    # morning check for files left over from before today
+OVERDUE_MINUTE = int(os.environ.get("OVERDUE_MINUTE", "0"))
 TAG_LOOKBACK_MINUTES = int(os.environ.get("TAG_LOOKBACK_MINUTES", "30"))
 DB_PATH = os.environ.get("DB_PATH", "tracker.db")
 
@@ -344,6 +347,71 @@ def build_summary_text(date=None):
         lines.append("\nพิมพ์ \"โหลดแล้ว\" หรือแค่ \"✅\" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ \"✅ <ชื่อคน>\" เพื่อติ๊กเฉพาะคนนั้น")
     return "\n".join(lines)
 
+# ---------- Flex building helpers (shared by the daily summary and the overdue digest) ----------
+MENTION_COLOR = "#E65100"   # tagged LINE name
+MESSAGE_COLOR = "#1E88E5"   # the rest of the message text
+MAX_PREVIEW = 100
+
+def flex_txt(content, **kwargs):
+    d = {"type": "text", "text": content, "wrap": True}
+    d.update(kwargs)
+    return d
+
+def message_text_component(prefix, text_content, mention_spans_json, suffix="", **kwargs):
+    """Builds a text component where the @mention substring(s) are colored
+    differently (orange, bold) from the rest of the message (blue)."""
+    raw = (text_content or "").replace("\n", " ")
+    spans = []
+    if mention_spans_json:
+        try:
+            spans = json.loads(mention_spans_json)
+        except (ValueError, TypeError):
+            spans = []
+
+    valid = []
+    for s in spans:
+        if isinstance(s, (list, tuple)) and len(s) == 2:
+            idx, length = s
+            if isinstance(idx, int) and isinstance(length, int) and 0 <= idx < len(raw) and length > 0:
+                valid.append((idx, min(idx + length, len(raw))))
+    valid.sort()
+    merged = []
+    for idx, e in valid:
+        if merged and idx <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((idx, e))
+
+    truncated = False
+    text = raw
+    if len(text) > MAX_PREVIEW:
+        text = text[:MAX_PREVIEW]
+        truncated = True
+        merged = [(i, min(e, MAX_PREVIEW)) for i, e in merged if i < MAX_PREVIEW]
+
+    spans_out = []
+    if prefix:
+        spans_out.append({"type": "span", "text": prefix, "color": MESSAGE_COLOR})
+    if not merged:
+        spans_out.append({"type": "span", "text": text or " ", "color": MESSAGE_COLOR})
+    else:
+        pos = 0
+        for idx, e in merged:
+            if idx > pos:
+                spans_out.append({"type": "span", "text": text[pos:idx], "color": MESSAGE_COLOR})
+            spans_out.append({"type": "span", "text": text[idx:e], "color": MENTION_COLOR, "weight": "bold"})
+            pos = e
+        if pos < len(text):
+            spans_out.append({"type": "span", "text": text[pos:], "color": MESSAGE_COLOR})
+    if truncated:
+        spans_out.append({"type": "span", "text": "...", "color": MESSAGE_COLOR})
+    if suffix:
+        spans_out.append({"type": "span", "text": suffix, "color": "#888888"})
+
+    d = {"type": "text", "wrap": True, "contents": spans_out}
+    d.update(kwargs)
+    return d
+
 def build_summary_flex(date=None, user_id=None):
     """Returns (alt_text, flex_contents_dict). flex_contents_dict is None when
     there's nothing to show, in which case alt_text is the plain message to send instead.
@@ -382,69 +450,7 @@ def build_summary_flex(date=None, user_id=None):
             (event_type, file_name, text_content, sent_at, downloaded, mention_spans, downloaded_by)
         )
 
-    def txt(content, **kwargs):
-        d = {"type": "text", "text": content, "wrap": True}
-        d.update(kwargs)
-        return d
-
-    MENTION_COLOR = "#E65100"   # tagged LINE name
-    MESSAGE_COLOR = "#1E88E5"   # the rest of the message text
-    MAX_PREVIEW = 100
-
-    def message_text_component(prefix, text_content, mention_spans_json, suffix="", **kwargs):
-        """Builds a text component where the @mention substring(s) are colored
-        differently (orange, bold) from the rest of the message (blue)."""
-        raw = (text_content or "").replace("\n", " ")
-        spans = []
-        if mention_spans_json:
-            try:
-                spans = json.loads(mention_spans_json)
-            except (ValueError, TypeError):
-                spans = []
-
-        valid = []
-        for s in spans:
-            if isinstance(s, (list, tuple)) and len(s) == 2:
-                idx, length = s
-                if isinstance(idx, int) and isinstance(length, int) and 0 <= idx < len(raw) and length > 0:
-                    valid.append((idx, min(idx + length, len(raw))))
-        valid.sort()
-        merged = []
-        for idx, e in valid:
-            if merged and idx <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((idx, e))
-
-        truncated = False
-        text = raw
-        if len(text) > MAX_PREVIEW:
-            text = text[:MAX_PREVIEW]
-            truncated = True
-            merged = [(i, min(e, MAX_PREVIEW)) for i, e in merged if i < MAX_PREVIEW]
-
-        spans_out = []
-        if prefix:
-            spans_out.append({"type": "span", "text": prefix, "color": MESSAGE_COLOR})
-        if not merged:
-            spans_out.append({"type": "span", "text": text or " ", "color": MESSAGE_COLOR})
-        else:
-            pos = 0
-            for idx, e in merged:
-                if idx > pos:
-                    spans_out.append({"type": "span", "text": text[pos:idx], "color": MESSAGE_COLOR})
-                spans_out.append({"type": "span", "text": text[idx:e], "color": MENTION_COLOR, "weight": "bold"})
-                pos = e
-            if pos < len(text):
-                spans_out.append({"type": "span", "text": text[pos:], "color": MESSAGE_COLOR})
-        if truncated:
-            spans_out.append({"type": "span", "text": "...", "color": MESSAGE_COLOR})
-        if suffix:
-            spans_out.append({"type": "span", "text": suffix, "color": "#888888"})
-
-        d = {"type": "text", "wrap": True, "contents": spans_out}
-        d.update(kwargs)
-        return d
+    txt = flex_txt
 
     body = [txt(f"📋 สรุปรายการที่แท็คคุณ", weight="bold", size="lg", color="#111111")]
     body.append(txt(date_str, size="sm", color="#888888", margin="xs"))
@@ -554,8 +560,81 @@ def send_daily_digest():
         else:
             push_flex_to(uid, alt_text, contents)
 
+# ---------- Overdue (leftover from previous days) morning digest ----------
+OVERDUE_COLOR = "#C62828"  # red
+
+def build_overdue_flex():
+    """Returns (alt_text, flex_contents_dict) for files tagged on a PREVIOUS day
+    that are still not marked downloaded, highlighted in red. Returns (None, None)
+    when there's nothing overdue, so the caller can skip sending anything."""
+    today_start = datetime.datetime.combine(datetime.date.today(), datetime.time.min).isoformat()
+
+    conn = db()
+    rows = conn.execute(
+        """SELECT group_name, sender_name, file_name, text_content, sent_at, mention_spans
+           FROM file_events
+           WHERE event_type = 'file' AND tagged = 1 AND downloaded = 0 AND sent_at < ?
+           ORDER BY group_name, sender_name, sent_at""",
+        (today_start,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return (None, None)
+
+    by_group = {}
+    for group_name, sender_name, file_name, text_content, sent_at, mention_spans in rows:
+        by_group.setdefault(group_name, {}).setdefault(sender_name, []).append(
+            (file_name, text_content, sent_at, mention_spans)
+        )
+
+    txt = flex_txt
+    body = [txt("⚠️ ไฟล์ค้างจากวันก่อนหน้า (ยังไม่โหลด)", weight="bold", size="lg", color=OVERDUE_COLOR)]
+    body.append(txt(f"ทั้งหมด {len(rows)} ไฟล์", size="sm", color=OVERDUE_COLOR, margin="xs"))
+    body.append({"type": "separator", "margin": "md"})
+
+    for group_name, by_sender in by_group.items():
+        body.append(txt(f"📁 {group_name}", weight="bold", size="md", color="#0B6E4F", margin="lg"))
+        for sender_name, items in by_sender.items():
+            body.append(txt(f"👤 {sender_name}", weight="bold", size="sm", color="#222222", margin="sm"))
+            for file_name, text_content, sent_at, mention_spans in items:
+                date_str = datetime.datetime.fromisoformat(sent_at).strftime("%d/%m %H:%M")
+                body.append(txt(f"🔴 {file_name}  ({date_str} น.)",
+                                 weight="bold", size="sm", color=OVERDUE_COLOR, margin="xs"))
+                if text_content:
+                    body.append(message_text_component(
+                        "💬 ", text_content, mention_spans, size="xs", margin="xs"
+                    ))
+
+    body.append({"type": "separator", "margin": "lg"})
+    body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ "✅ <ชื่อคน>" เพื่อติ๊กเฉพาะคนนั้น',
+                     size="xs", color="#888888", margin="md"))
+
+    contents = {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "xs",
+            "contents": body
+        }
+    }
+    alt_text = f"⚠️ มีไฟล์ค้างจากวันก่อนหน้ายังไม่โหลด {len(rows)} ไฟล์"
+    return (alt_text, contents)
+
+def send_overdue_digest():
+    alt_text, contents = build_overdue_flex()
+    if contents is None:
+        return  # nothing overdue - stay quiet
+    recipients = set(TAGGED_USER_IDS)
+    if OWNER_USER_ID:
+        recipients.add(OWNER_USER_ID)
+    for uid in recipients:
+        push_flex_to(uid, alt_text, contents)
+
 scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 scheduler.add_job(send_daily_digest, "cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
+scheduler.add_job(send_overdue_digest, "cron", hour=OVERDUE_HOUR, minute=OVERDUE_MINUTE)
 scheduler.start()
 
 @app.route("/", methods=["GET"])
