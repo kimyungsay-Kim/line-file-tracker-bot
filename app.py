@@ -466,9 +466,13 @@ def build_summary_flex(date=None, user_id=None):
     conn = db()
     rows = conn.execute(
         """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids, downloaded_by
-           FROM file_events WHERE sent_at BETWEEN ? AND ? AND tagged = 1
+           FROM file_events
+           WHERE tagged = 1 AND (
+               (sent_at BETWEEN ? AND ?)
+               OR (event_type = 'file' AND downloaded = 0 AND sent_at < ?)
+           )
            ORDER BY group_name, sender_name, sent_at""",
-        (start, end)
+        (start, end, start)
     ).fetchall()
     conn.close()
 
@@ -519,10 +523,13 @@ def build_summary_flex(date=None, user_id=None):
                     truncated = True
                     break
                 item_count += 1
-                t = datetime.datetime.fromisoformat(sent_at).strftime("%H:%M")
+                sent_dt = datetime.datetime.fromisoformat(sent_at)
+                is_overdue = event_type == "file" and not downloaded and sent_dt.date() < date
+                t = sent_dt.strftime("%d/%m %H:%M") if is_overdue else sent_dt.strftime("%H:%M")
                 if event_type == "file":
-                    mark = "✅" if downloaded else "🔲"
-                    body.append(two_tone_text(f"{mark} {file_name}", FILE_NAME_COLOR, f"  ({t} น.)",
+                    mark = "✅" if downloaded else ("🔴" if is_overdue else "🔲")
+                    name_color = OVERDUE_COLOR if is_overdue else FILE_NAME_COLOR
+                    body.append(two_tone_text(f"{mark} {file_name}", name_color, f"  ({t} น.)",
                                                size="sm", margin="xs"))
                     if downloaded and downloaded_by:
                         body.append(txt(f"   โหลดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
