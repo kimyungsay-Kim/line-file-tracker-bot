@@ -43,6 +43,17 @@ TAG_LOOKBACK_MINUTES = int(os.environ.get("TAG_LOOKBACK_MINUTES", "30"))
 TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
 TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
 
+def _turso_http_url(url):
+    """libsql_client maps the libsql:// scheme to a WebSocket (hrana) connection.
+    That WebSocket handshake fails (400 Invalid response status) in some hosting
+    environments (e.g. Render). Forcing the https:// scheme makes the client use
+    plain HTTP (hrana-over-HTTP) instead, which works reliably there."""
+    if url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    return url
+
+TURSO_HTTP_URL = _turso_http_url(TURSO_DATABASE_URL)
+
 app = Flask(__name__)
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
@@ -119,11 +130,11 @@ class _LibsqlConn:
         self._client.close()
 
 def db():
-    client = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    client = libsql_client.create_client_sync(url=TURSO_HTTP_URL, auth_token=TURSO_AUTH_TOKEN)
     return _LibsqlConn(client)
 
 def init_db_schema():
-    client = libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    client = libsql_client.create_client_sync(url=TURSO_HTTP_URL, auth_token=TURSO_AUTH_TOKEN)
     try:
         for stmt in SCHEMA_STATEMENTS:
             client.execute(stmt)
