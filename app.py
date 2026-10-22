@@ -467,7 +467,7 @@ def build_summary_flex(date=None, user_id=None):
             if item_count >= MAX_ITEMS:
                 truncated = True
                 break
-            pending_count = sum(1 for e, _, _, _, d in items if e == "file" and not d)
+            pending_count = sum(1 for e, _, _, _, d, *_ in items if e == "file" and not d)
             pending_total += pending_count
             label = f"  (ยังไม่โหลด {pending_count})" if any(e == "file" for e, *_ in items) else ""
             sender_line = f"👤 {sender_name}{label}"
