@@ -407,23 +407,32 @@ def build_summary_flex(date=None):
 def mark_downloaded(sender_name=None):
     conn = db()
     if sender_name:
-        cur = conn.execute(
-            "UPDATE file_events SET downloaded = 1, downloaded_at = ? WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file' AND sender_name = ?",
-            (datetime.datetime.now().isoformat(), sender_name)
-        )
+        pending = conn.execute(
+            "SELECT id, sender_name, file_name FROM file_events WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file' AND sender_name = ?",
+            (sender_name,)
+        ).fetchall()
     else:
-        cur = conn.execute(
-            "UPDATE file_events SET downloaded = 1, downloaded_at = ? WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file'",
-            (datetime.datetime.now().isoformat(),)
-        )
-    count = cur.rowcount
+        pending = conn.execute(
+            "SELECT id, sender_name, file_name FROM file_events WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file'"
+        ).fetchall()
+
+    if not pending:
+        conn.close()
+        return f"ไม่มีไฟล์ค้างให้ติ๊กครับ{' (ของ ' + sender_name + ')' if sender_name else ''}"
+
+    ids = [row[0] for row in pending]
+    conn.executemany(
+        "UPDATE file_events SET downloaded = 1, downloaded_at = ? WHERE id = ?",
+        [(datetime.datetime.now().isoformat(), i) for i in ids]
+    )
     conn.commit()
     conn.close()
 
-    if count == 0:
-        return f"ไม่มีไฟล์ค้างให้ติ๊กครับ{' (ของ ' + sender_name + ')' if sender_name else ''}"
     target = f"ของ {sender_name} " if sender_name else ""
-    return f"ติ๊กว่าโหลดแล้ว {target}{count} ไฟล์ ✅"
+    lines = [f"ติ๊กว่าโหลดแล้ว {target}{len(pending)} ไฟล์ ✅", ""]
+    for _, sname, fname in pending:
+        lines.append(f"✅ {fname} ({sname})" if not sender_name else f"✅ {fname}")
+    return "\n".join(lines)
 
 # ---------- Daily digest ----------
 def send_daily_digest():
