@@ -567,7 +567,7 @@ INSPECTION_LABEL_COLOR = "#90A4AE"
 INSPECTION_DOCNUM_COLOR = "#1E88E5"      # เลขที่เอกสาร (เช่น AR-333)
 INSPECTION_CODE_COLOR = "#6A1B9A"        # Code (เช่น RIH-I02222)
 INSPECTION_SUBJECT_COLOR = "#212121"     # เรื่อง
-INSPECTION_DATE_COLOR = "#2E7D32"        # วันที่เอกสาร
+INSPECTION_DATE_COLOR = "#2E7D32"        # วันที่ส่งเอกสารเข้าระบบ
 INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ
 
 INSPECTION_MAX_ITEMS = 30  # safety cap so the flex message doesn't blow past LINE's size limit
@@ -599,7 +599,7 @@ def build_inspection_carousel_flex(items):
         body.append(field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, value_size="lg", bold=True))
         body.append(field("🔖", "Code", it["doc_number"], INSPECTION_CODE_COLOR))
         body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_SUBJECT_COLOR, value_size="sm"))
-        body.append(field("📅", "วันที่เอกสาร", it["date"], INSPECTION_DATE_COLOR, value_size="sm"))
+        body.append(field("📅", "วันที่ส่งเอกสารเข้าระบบ", it["date"], INSPECTION_DATE_COLOR, value_size="sm"))
         if it.get("extra_note"):
             body.append(field("🧱", "วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ", it["extra_note"],
                                INSPECTION_EXTRA_NOTE_COLOR, value_size="sm"))
