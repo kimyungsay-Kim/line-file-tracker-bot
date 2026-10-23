@@ -730,6 +730,20 @@ def flex_txt(content, **kwargs):
     d.update(kwargs)
     return d
 
+GROUP_NAME_BG_COLOR = "#E8F5E9"    # light green highlight behind the group name
+GROUP_NAME_TEXT_COLOR = "#0B6E4F"  # matches the group header's existing green
+
+def group_name_badge(group_name, margin="lg"):
+    """A highlighted pill behind the group name, so it stands out at a
+    glance when scanning a summary with several groups in it."""
+    return {
+        "type": "box", "layout": "vertical", "margin": margin,
+        "backgroundColor": GROUP_NAME_BG_COLOR, "cornerRadius": "md", "paddingAll": "sm",
+        "contents": [
+            flex_txt(f"📁 {group_name}", weight="bold", size="md", color=GROUP_NAME_TEXT_COLOR)
+        ]
+    }
+
 TIME_COLOR = "#888888"  # timestamps, kept visually distinct from the text next to them
 
 def two_tone_text(main_text, main_color, suffix_text, suffix_color=TIME_COLOR, **kwargs):
@@ -851,7 +865,7 @@ def build_summary_flex(date=None, user_id=None):
     truncated = False
 
     for group_name, by_sender in by_group.items():
-        body.append(txt(f"📁 {group_name}", weight="bold", size="md", color="#0B6E4F", margin="lg"))
+        body.append(group_name_badge(group_name))
         for sender_name, items in by_sender.items():
             if item_count >= MAX_ITEMS:
                 truncated = True
@@ -1104,7 +1118,7 @@ def build_overdue_flex():
     body.append({"type": "separator", "margin": "md"})
 
     for group_name, by_sender in by_group.items():
-        body.append(txt(f"📁 {group_name}", weight="bold", size="md", color="#0B6E4F", margin="lg"))
+        body.append(group_name_badge(group_name))
         for sender_name, items in by_sender.items():
             body.append(txt(f"👤 {sender_name}", weight="bold", size="sm", color="#222222", margin="sm"))
             for file_name, text_content, sent_at, mention_spans in items:
