@@ -908,12 +908,24 @@ def build_summary_flex(date=None, user_id=None):
     alt_text = f"สรุปรายการที่แท็คคุณ วันที่ {date_str} ({item_count} รายการ)"
     return (alt_text, contents)
 
+def _normalize_name_for_match(name):
+    # strip whitespace and any surrounding bracket/quote characters people
+    # commonly (mis)type around a name, e.g. "<StarbugBank>", "[Starbug]",
+    # so "โหลดแล้ว <StarbugBank>" still matches the real display name
+    # "StarbugBank" instead of silently matching nothing.
+    name = name.strip()
+    name = name.strip("<>[](){}「」【】《》\"'‘’“”")
+    return name.strip().lower()
+
 def mark_downloaded(sender_name=None, marked_by_name=None):
     conn = db()
     if sender_name:
+        normalized = _normalize_name_for_match(sender_name)
         pending = conn.execute(
-            "SELECT id, sender_name, file_name FROM file_events WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file' AND sender_name = ?",
-            (sender_name,)
+            "SELECT id, sender_name, file_name FROM file_events "
+            "WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file' "
+            "AND LOWER(TRIM(sender_name)) = ?",
+            (normalized,)
         ).fetchall()
     else:
         pending = conn.execute(
@@ -922,7 +934,21 @@ def mark_downloaded(sender_name=None, marked_by_name=None):
 
     if not pending:
         conn.close()
-        return f"ไม่มีไฟล์ค้างให้ติ๊กครับ{' (ของ ' + sender_name + ')' if sender_name else ''}"
+        if not sender_name:
+            return "ไม่มีไฟล์ค้างให้ติ๊กครับ"
+        # name didn't match anyone with a pending file - show the actual
+        # pending names so the user can see the real spelling and retry,
+        # instead of a generic message that reads like "already done".
+        conn2 = db()
+        others = conn2.execute(
+            "SELECT DISTINCT sender_name FROM file_events WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file'"
+        ).fetchall()
+        conn2.close()
+        if others:
+            names = ", ".join(r[0] for r in others)
+            return (f'ไม่พบชื่อ "{sender_name}" ในรายการที่ยังไม่โหลดครับ ชื่อที่พิมพ์อาจไม่ตรงกับในระบบเป๊ะๆ '
+                     f'(เช่น มี < > ติดมาด้วย)\nรายชื่อที่ยังมีไฟล์ค้างอยู่ตอนนี้: {names}')
+        return f'ไม่มีไฟล์ค้างให้ติ๊กครับ (ของ "{sender_name}")'
 
     ids = [row[0] for row in pending]
     now_iso = bkk_now().isoformat()
