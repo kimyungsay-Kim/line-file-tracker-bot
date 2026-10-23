@@ -564,11 +564,9 @@ def clear_inspection_preview(user_id):
     conn.close()
 
 INSPECTION_LABEL_COLOR = "#90A4AE"
-INSPECTION_DOCNUM_COLOR = "#1E88E5"      # เลขที่เอกสาร (เช่น AR-333)
-INSPECTION_CODE_COLOR = "#6A1B9A"        # Code (เช่น RIH-I02222)
-INSPECTION_SUBJECT_COLOR = "#212121"     # เรื่อง
-INSPECTION_DATE_COLOR = "#2E7D32"        # วันที่ส่งเอกสารเข้าระบบ
-INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ
+INSPECTION_VALUE_COLOR = "#000000"       # Code / เรื่อง / วันที่ส่งเอกสารเข้าระบบ - plain black
+INSPECTION_DOCNUM_COLOR = "#1E88E5"      # เลขที่เอกสาร (เช่น AR-333) - kept colored
+INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ - kept colored
 
 INSPECTION_MAX_ITEMS = 30  # safety cap so the flex message doesn't blow past LINE's size limit
 
@@ -582,12 +580,12 @@ def build_inspection_carousel_flex(items):
     between documents."""
     txt = flex_txt
 
-    def field(emoji, label, value, color, value_size="md", bold=False):
+    def field(emoji, label, value, color, bold=False):
         return {
             "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
             "contents": [
                 txt(f"{emoji} {label}", size="xs", color=INSPECTION_LABEL_COLOR, weight="bold"),
-                txt(value, size=value_size, color=color, wrap=True, weight="bold" if bold else "regular"),
+                txt(value, size="xs", color=color, wrap=True, weight="bold" if bold else "regular"),
             ]
         }
 
@@ -596,13 +594,13 @@ def build_inspection_carousel_flex(items):
     for i, it in enumerate(shown):
         if i > 0:
             body.append({"type": "separator", "margin": "xl"})
-        body.append(field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, value_size="lg", bold=True))
-        body.append(field("🔖", "Code", it["doc_number"], INSPECTION_CODE_COLOR))
-        body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_SUBJECT_COLOR, value_size="sm"))
-        body.append(field("📅", "วันที่ส่งเอกสารเข้าระบบ", it["date"], INSPECTION_DATE_COLOR, value_size="sm"))
+        body.append(field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, bold=True))
+        body.append(field("🔖", "Code", it["doc_number"], INSPECTION_VALUE_COLOR))
+        body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_VALUE_COLOR))
+        body.append(field("📅", "วันที่ส่งเอกสารเข้าระบบ", it["date"], INSPECTION_VALUE_COLOR))
         if it.get("extra_note"):
             body.append(field("🧱", "วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ", it["extra_note"],
-                               INSPECTION_EXTRA_NOTE_COLOR, value_size="sm"))
+                               INSPECTION_EXTRA_NOTE_COLOR))
 
     if len(items) > INSPECTION_MAX_ITEMS:
         body.append({"type": "separator", "margin": "xl"})
