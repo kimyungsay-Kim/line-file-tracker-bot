@@ -30,3 +30,5 @@ services:
         sync: false
       - key: TURSO_AUTH_TOKEN
         sync: false
+      - key: INSPECTION_TARGET_GROUP_ID
+        sync: false

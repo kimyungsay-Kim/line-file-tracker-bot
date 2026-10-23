@@ -4,6 +4,7 @@ import datetime
 from zoneinfo import ZoneInfo
 
 import libsql_client
+import requests
 
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -37,6 +38,10 @@ DIGEST_MINUTE = int(os.environ.get("DIGEST_MINUTE", "0"))
 OVERDUE_HOUR = int(os.environ.get("OVERDUE_HOUR", "8"))    # morning check for files left over from before today
 OVERDUE_MINUTE = int(os.environ.get("OVERDUE_MINUTE", "0"))
 TAG_LOOKBACK_MINUTES = int(os.environ.get("TAG_LOOKBACK_MINUTES", "30"))
+
+# Group that pasted Site Around inspection-document lists get posted to after
+# an admin confirms the preview (see "Inspection document list" below).
+INSPECTION_TARGET_GROUP_ID = os.environ.get("INSPECTION_TARGET_GROUP_ID", "")
 
 # Turso (hosted libSQL/SQLite) - persistent storage, survives redeploys unlike a local
 # sqlite file on Render's free tier (which has no disk and resets on every deploy).
@@ -90,6 +95,15 @@ SCHEMA_STATEMENTS = [
         text_content TEXT,
         mention_spans TEXT,
         tagged_user_ids TEXT,
+        created_at TEXT
+    )
+    """,
+    # one pending "inspection document list" preview per admin, awaiting
+    # ส่ง/ยกเลิก confirmation before it's posted to the group
+    """
+    CREATE TABLE IF NOT EXISTS pending_inspection_previews (
+        user_id TEXT PRIMARY KEY,
+        items_json TEXT,
         created_at TEXT
     )
     """,
@@ -228,6 +242,44 @@ def push_flex_to(user_id, alt_text, contents_dict):
 def push_flex_to_owner(alt_text, contents_dict):
     push_flex_to(OWNER_USER_ID, alt_text, contents_dict)
 
+def reply_flex_and_text(reply_token, alt_text, contents_dict, text):
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[
+                FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict)),
+                TextMessage(text=text),
+            ]
+        ))
+
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_text="📋 เอกสารตรวจสอบใหม่"):
+    """Pushes the Flex Carousel followed by an '@All'-mention text message to
+    the given group. Uses a raw HTTP call instead of the messaging SDK's
+    typed message classes because the installed line-bot-sdk version here
+    doesn't expose LINE's textV2/mention payload - this builds that payload
+    directly, per LINE's documented format."""
+    messages = [
+        {"type": "flex", "altText": flex_alt_text, "contents": flex_contents},
+        {
+            "type": "textV2",
+            "text": f"{lead_text} {{user1}} โปรดตรวจสอบครับ",
+            "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}},
+        },
+    ]
+    resp = requests.post(
+        LINE_PUSH_URL,
+        headers={
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"to": group_id, "messages": messages},
+        timeout=15,
+    )
+    resp.raise_for_status()
+
 # ---------- Webhook ----------
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -286,6 +338,30 @@ def handle_text(event):
 
     # --- 1:1 chat with the owner: on-demand commands ---
     if source.type == "user":
+        user_id = source.user_id
+
+        # --- Inspection document list: paste "code|doc_number|subject|date"
+        # lines (one per document, as Claude in Chrome summarizes them from
+        # Site Around) to get a Flex Carousel preview, then confirm/cancel. ---
+        if text in ("ส่ง", "ยืนยัน", "confirm", "yes"):
+            reply(event.reply_token, handle_inspection_confirm(user_id))
+            return
+        if text in ("ยกเลิก", "cancel"):
+            if get_inspection_preview(user_id) is not None:
+                clear_inspection_preview(user_id)
+                reply(event.reply_token, "ยกเลิกรายการที่รอส่งแล้วครับ")
+            return
+
+        parsed_items = parse_inspection_paste(text)
+        if parsed_items is not None:
+            alt_text, contents = build_inspection_carousel_flex(parsed_items)
+            save_inspection_preview(user_id, parsed_items)
+            reply_flex_and_text(
+                event.reply_token, alt_text, contents,
+                f'พบเอกสาร {len(parsed_items)} รายการครับ ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
+            )
+            return
+
         if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
             # shared summary: everyone tracked sees the same tagged events,
             # regardless of who specifically got tagged
@@ -382,6 +458,103 @@ def handle_text(event):
 
     conn.commit()
     conn.close()
+
+# ---------- Inspection document list (paste from Claude in Chrome) ----------
+def parse_inspection_paste(text):
+    """Parses pasted lines in the confirmed "code|doc_number|subject|date"
+    format (one document per line), e.g.:
+        AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026
+    Returns a list of {"code", "doc_number", "subject", "date"} dicts, or
+    None if the text doesn't look like this format at all - so the caller
+    falls through to the other 1:1 commands untouched."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    items = []
+    for ln in lines:
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) != 4 or not all(parts):
+            return None
+        code, doc_number, subject, date_str = parts
+        items.append({"code": code, "doc_number": doc_number, "subject": subject, "date": date_str})
+    return items
+
+def save_inspection_preview(user_id, items):
+    conn = db()
+    conn.execute("DELETE FROM pending_inspection_previews WHERE user_id = ?", (user_id,))
+    conn.execute(
+        "INSERT INTO pending_inspection_previews (user_id, items_json, created_at) VALUES (?,?,?)",
+        (user_id, json.dumps(items, ensure_ascii=False), bkk_now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def get_inspection_preview(user_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT items_json FROM pending_inspection_previews WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+
+def clear_inspection_preview(user_id):
+    conn = db()
+    conn.execute("DELETE FROM pending_inspection_previews WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+INSPECTION_CODE_COLOR = "#1E88E5"
+INSPECTION_LABEL_COLOR = "#888888"
+INSPECTION_VALUE_COLOR = "#111111"
+
+def build_inspection_carousel_flex(items):
+    """One bubble per document: code (title), doc_number/subject/date (fields).
+    Mirrors the flex_txt-based style used by the other builders in this file."""
+    txt = flex_txt
+    bubbles = []
+    for it in items:
+        def field(label, value):
+            return {
+                "type": "box", "layout": "baseline", "margin": "sm",
+                "contents": [
+                    txt(label, size="xs", color=INSPECTION_LABEL_COLOR, flex=3),
+                    txt(value, size="sm", color=INSPECTION_VALUE_COLOR, flex=6, wrap=True),
+                ]
+            }
+        body = [
+            txt(it["code"], weight="bold", size="lg", color=INSPECTION_CODE_COLOR),
+            {"type": "separator", "margin": "md"},
+            field("เลขที่เอกสาร", it["doc_number"]),
+            field("เรื่อง", it["subject"]),
+            field("วันที่", it["date"]),
+        ]
+        bubbles.append({
+            "type": "bubble",
+            "size": "kilo",
+            "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body},
+        })
+    contents = {"type": "carousel", "contents": bubbles}
+    alt_text = f"เอกสารตรวจสอบ {len(items)} รายการ"
+    return alt_text, contents
+
+def handle_inspection_confirm(user_id):
+    items = get_inspection_preview(user_id)
+    if not items:
+        return 'ไม่มีรายการที่รอยืนยันอยู่ครับ ลองวางข้อมูลเอกสารรูปแบบ "code|doc_number|subject|date" ก่อนนะครับ'
+    if not INSPECTION_TARGET_GROUP_ID:
+        return "ยังไม่ได้ตั้งค่า INSPECTION_TARGET_GROUP_ID ปลายทางครับ แจ้งผู้ดูแลระบบด้วย"
+    alt_text, contents = build_inspection_carousel_flex(items)
+    try:
+        push_mention_all_to_group(INSPECTION_TARGET_GROUP_ID, alt_text, contents)
+    except Exception:
+        return "โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือแจ้งผู้ดูแลระบบ"
+    clear_inspection_preview(user_id)
+    return "โพสต์เข้ากลุ่มเรียบร้อยแล้วครับ"
 
 # ---------- Summary building ----------
 def build_summary_text(date=None):
