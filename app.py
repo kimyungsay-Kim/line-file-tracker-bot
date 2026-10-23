@@ -7,6 +7,9 @@ from zoneinfo import ZoneInfo
 
 import libsql_client
 import requests
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 from flask import Flask, request, abort, Response
 from linebot.v3 import WebhookHandler
@@ -419,7 +422,8 @@ def handle_text(event):
             ))
         elif text in ("รายงาน", "report", "export"):
             reply(event.reply_token,
-                  f"ดาวน์โหลดรายงานวันนี้ (CSV เปิดด้วย Excel ได้เลย):\n{daily_report_url()}\n\n"
+                  f"ดาวน์โหลดรายงานวันนี้ (ไฟล์ Excel จัดสีสวยพร้อมเปิด):\n{daily_report_url()}\n\n"
+                  f"หรือแบบ CSV ดิบ:\n{daily_report_url(fmt='csv')}\n\n"
                   f"ดูวันอื่นได้โดยเติม ?date=YYYY-MM-DD ต่อท้ายลิงก์")
         return
 
@@ -1069,7 +1073,163 @@ def report_daily_csv():
         headers={"Content-Disposition": f'attachment; filename="report_{date.isoformat()}.csv"'}
     )
 
-def daily_report_url(date=None):
+# ---------- Daily backend report (styled Excel) ----------
+REPORT_XLSX_COLUMNS = REPORT_CSV_COLUMNS
+REPORT_COL_WIDTHS = [12, 26, 16, 10, 40, 42, 18, 12, 14, 18, 18]
+
+NAVY = "1F3864"
+TEAL = "0B6E4F"
+GREEN_BG = "E8F5E9"
+GREEN_TXT = "1B5E20"
+RED_BG = "FDECEA"
+RED_TXT = "C62828"
+ORANGE_TXT = "E65100"
+GROUP_BG = "D9EAD6"
+ZEBRA_BG = "F7F9FC"
+BLUE_TXT = "1565C0"
+PURPLE_TXT = "6A1B9A"
+GREY_TXT = "616161"
+
+THIN = Side(style="thin", color="D9D9D9")
+CELL_BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+def build_daily_report_xlsx(date=None):
+    """A styled, color-coded Excel report: title banner, KPI summary strip,
+    a highlighted group header row per กลุ่ม (same visual language as the
+    LINE Flex summary's badges), zebra-striped data rows, and the สถานะ
+    column colored green/red so it reads at a glance."""
+    date = date or bkk_today()
+    rows = build_daily_report_rows(date)
+    date_str = date.strftime("%d/%m/%Y")
+
+    total = len(rows)
+    closed = sum(1 for r in rows if r["สถานะ"] == "ปิดแล้ว")
+    pending = total - closed
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "รายงานรายวัน"
+    ncols = len(REPORT_XLSX_COLUMNS)
+    last_col_letter = get_column_letter(ncols)
+
+    # --- Title banner ---
+    ws.merge_cells(f"A1:{last_col_letter}1")
+    title_cell = ws["A1"]
+    title_cell.value = f"📋 รายงานข้อมูลเอกสาร/ข้อความประจำวันที่ {date_str}"
+    title_cell.font = Font(size=16, bold=True, color="FFFFFF")
+    title_cell.fill = PatternFill("solid", fgColor=NAVY)
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 32
+
+    # --- KPI summary strip (3 colored cards) ---
+    third = max(ncols // 3, 1)
+    kpi_specs = [
+        (1, third, f"ทั้งหมด {total} รายการ", "455A64"),
+        (third + 1, third * 2, f"✅ ปิดแล้ว {closed}", TEAL),
+        (third * 2 + 1, ncols, f"🔲 ยังไม่ปิด {pending}", "C62828" if pending else "9E9E9E"),
+    ]
+    for start, end, text, color in kpi_specs:
+        start_letter = get_column_letter(start)
+        end_letter = get_column_letter(max(end, start))
+        ws.merge_cells(f"{start_letter}2:{end_letter}2")
+        cell = ws[f"{start_letter}2"]
+        cell.value = text
+        cell.font = Font(size=12, bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=color)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 24
+
+    # --- blank spacer row ---
+    ws.row_dimensions[3].height = 6
+
+    # --- header row ---
+    header_row = 4
+    for i, col_name in enumerate(REPORT_XLSX_COLUMNS, start=1):
+        cell = ws.cell(row=header_row, column=i, value=col_name)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=TEAL)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = CELL_BORDER
+    ws.row_dimensions[header_row].height = 22
+
+    # --- grouped data rows ---
+    by_group = {}
+    group_order = []
+    for r in rows:
+        g = r["กลุ่ม"]
+        if g not in by_group:
+            by_group[g] = []
+            group_order.append(g)
+        by_group[g].append(r)
+
+    r_idx = header_row + 1
+    for group_name in group_order:
+        ws.merge_cells(f"A{r_idx}:{last_col_letter}{r_idx}")
+        gcell = ws.cell(row=r_idx, column=1, value=f"📁 {group_name}")
+        gcell.font = Font(bold=True, color=TEAL, size=11)
+        gcell.fill = PatternFill("solid", fgColor=GROUP_BG)
+        gcell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.row_dimensions[r_idx].height = 20
+        r_idx += 1
+
+        for zebra_i, row_dict in enumerate(by_group[group_name]):
+            for col_i, col_name in enumerate(REPORT_XLSX_COLUMNS, start=1):
+                cell = ws.cell(row=r_idx, column=col_i, value=row_dict[col_name])
+                cell.border = CELL_BORDER
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center",
+                    wrap_text=col_name in ("ชื่อไฟล์", "ข้อความ")
+                )
+                if zebra_i % 2 == 1:
+                    cell.fill = PatternFill("solid", fgColor=ZEBRA_BG)
+
+                if col_name == "สถานะ":
+                    cell.font = Font(bold=True, color=GREEN_TXT if row_dict[col_name] == "ปิดแล้ว" else RED_TXT)
+                    cell.fill = PatternFill("solid", fgColor=GREEN_BG if row_dict[col_name] == "ปิดแล้ว" else RED_BG)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_name == "ประเภท":
+                    cell.font = Font(bold=True, color=BLUE_TXT if row_dict[col_name] == "ไฟล์" else PURPLE_TXT)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_name == "หมายเหตุ" and row_dict[col_name] == "ยกยอดจากวันก่อน":
+                    cell.font = Font(bold=True, color=ORANGE_TXT)
+                elif col_name == "วันที่สรุป" or col_name == "วันที่ส่งจริง" or col_name == "วันที่โหลด":
+                    cell.font = Font(color=GREY_TXT)
+            r_idx += 1
+
+    if total == 0:
+        ws.merge_cells(f"A{r_idx}:{last_col_letter}{r_idx}")
+        empty_cell = ws.cell(row=r_idx, column=1, value="ไม่มีรายการสำหรับวันที่นี้ครับ 🎉")
+        empty_cell.font = Font(italic=True, color=GREY_TXT)
+        empty_cell.alignment = Alignment(horizontal="center", vertical="center")
+        r_idx += 1
+
+    # --- column widths, freeze header, autofilter ---
+    for i, width in enumerate(REPORT_COL_WIDTHS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.freeze_panes = f"A{header_row + 1}"
+    if total:
+        ws.auto_filter.ref = f"A{header_row}:{last_col_letter}{r_idx - 1}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+@app.route("/report/daily.xlsx", methods=["GET"])
+def report_daily_xlsx():
+    if REPORT_ACCESS_KEY and request.args.get("key", "") != REPORT_ACCESS_KEY:
+        abort(403)
+    date_str = request.args.get("date", "")
+    try:
+        date = datetime.date.fromisoformat(date_str) if date_str else bkk_today()
+    except ValueError:
+        abort(400, "date must be YYYY-MM-DD")
+    return Response(
+        build_daily_report_xlsx(date),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="report_{date.isoformat()}.xlsx"'}
+    )
+
+def daily_report_url(date=None, fmt="xlsx"):
     date = date or bkk_today()
     base = SERVICE_BASE_URL
     if not base:
@@ -1077,7 +1237,7 @@ def daily_report_url(date=None):
             base = request.host_url.rstrip("/")
         except RuntimeError:
             return None  # no SERVICE_BASE_URL set and no request context (e.g. the scheduler)
-    url = f"{base}/report/daily.csv?date={date.isoformat()}"
+    url = f"{base}/report/daily.{fmt}?date={date.isoformat()}"
     if REPORT_ACCESS_KEY:
         url += f"&key={REPORT_ACCESS_KEY}"
     return url
@@ -1098,7 +1258,7 @@ def send_daily_digest():
     report_url = daily_report_url()
     if report_url:
         for uid in recipients:
-            push_to(uid, f"📄 รายงานข้อมูลวันนี้ (CSV เปิดด้วย Excel ได้เลย):\n{report_url}")
+            push_to(uid, f"📄 รายงานข้อมูลวันนี้ (ไฟล์ Excel จัดสีสวยพร้อมเปิด):\n{report_url}")
 
 # ---------- Overdue (leftover from previous days) morning digest ----------
 OVERDUE_COLOR = "#C62828"  # red
