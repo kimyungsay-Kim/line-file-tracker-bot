@@ -826,8 +826,8 @@ def build_summary_flex(date=None, user_id=None):
         """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids, downloaded_by
            FROM file_events
            WHERE tagged = 1 AND (
-               (sent_at BETWEEN ? AND ? AND NOT (event_type = 'file' AND downloaded = 1))
-               OR (event_type = 'file' AND downloaded = 0 AND sent_at < ?)
+               (sent_at BETWEEN ? AND ? AND NOT downloaded = 1)
+               OR (downloaded = 0 AND sent_at < ?)
            )
            ORDER BY group_name, sender_name, sent_at""",
         (start, end, start)
@@ -870,9 +870,9 @@ def build_summary_flex(date=None, user_id=None):
             if item_count >= MAX_ITEMS:
                 truncated = True
                 break
-            pending_count = sum(1 for e, _, _, _, d, *_ in items if e == "file" and not d)
+            pending_count = sum(1 for e, _, _, _, d, *_ in items if not d)
             pending_total += pending_count
-            label = f"  (ยังไม่โหลด {pending_count})" if any(e == "file" for e, *_ in items) else ""
+            label = f"  (ค้าง {pending_count})" if pending_count else ""
             sender_line = f"👤 {sender_name}{label}"
             body.append(txt(sender_line, weight="bold", size="sm", color="#222222", margin="sm"))
 
@@ -882,32 +882,34 @@ def build_summary_flex(date=None, user_id=None):
                     break
                 item_count += 1
                 sent_dt = datetime.datetime.fromisoformat(sent_at)
-                is_overdue = event_type == "file" and not downloaded and sent_dt.date() < date
+                is_overdue = not downloaded and sent_dt.date() < date
                 t = sent_dt.strftime("%d/%m %H:%M") if is_overdue else sent_dt.strftime("%H:%M")
+                mark = "✅" if downloaded else ("🔴" if is_overdue else "🔲")
                 if event_type == "file":
-                    mark = "✅" if downloaded else ("🔴" if is_overdue else "🔲")
                     name_color = OVERDUE_COLOR if is_overdue else FILE_NAME_COLOR
                     body.append(two_tone_text(f"{mark} {file_name}", name_color, f"  ({t} น.)",
                                                size="sm", margin="xs"))
                     if downloaded and downloaded_by:
-                        body.append(txt(f"   โหลดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
+                        body.append(txt(f"   ปิดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
                     if text_content:
                         body.append(message_text_component(
                             "💬 ", text_content, mention_spans, size="xs", margin="xs"
                         ))
                 else:
                     body.append(message_text_component(
-                        "💬 ", text_content, mention_spans, suffix=f"  ({t} น.)", size="sm", margin="xs"
+                        f"{mark} 💬 ", text_content, mention_spans, suffix=f"  ({t} น.)", size="sm", margin="xs"
                     ))
+                    if downloaded and downloaded_by:
+                        body.append(txt(f"   ปิดโดย {downloaded_by}", size="xs", color="#0B6E4F", margin="none"))
 
     if truncated:
         body.append(txt("… มีรายการเพิ่มเติมที่ไม่ได้แสดงครบ", size="xs", color="#999999", margin="md"))
 
     body.append({"type": "separator", "margin": "lg"})
     if pending_total == 0:
-        body.append(txt("ไฟล์งานโหลดครบแล้วครับ 🎉", size="sm", color="#0B6E4F", margin="md"))
+        body.append(txt("ปิดสถานะครบทุกรายการแล้วครับ 🎉", size="sm", color="#0B6E4F", margin="md"))
     else:
-        body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ "✅ <ชื่อคน>" เพื่อติ๊กเฉพาะคนนั้น',
+        body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อปิดสถานะทั้งหมด หรือ "✅ <ชื่อคน>" เพื่อปิดเฉพาะคนนั้น',
                          size="xs", color="#888888", margin="md"))
 
     contents = {
@@ -931,38 +933,51 @@ def _normalize_name_for_match(name):
     name = name.strip("<>[](){}「」【】《》\"'‘’“”")
     return name.strip().lower()
 
+def _item_label(file_name, text_content):
+    """Short display label for a pending item in mark_downloaded's reply:
+    the file name for a file event, or a trimmed snippet of the tagged
+    message text for a text/pm event (which has no file_name)."""
+    if file_name:
+        return file_name
+    snippet = (text_content or "").replace("\n", " ").strip()
+    if len(snippet) > 40:
+        snippet = snippet[:40] + "…"
+    return snippet or "ข้อความที่ถูกแท็ค"
+
 def mark_downloaded(sender_name=None, marked_by_name=None):
+    # covers BOTH file events and tagged-message (text/pm) events - closing
+    # either kind is the same "โหลดแล้ว"/"✅" action, just worded generically.
     conn = db()
     if sender_name:
         normalized = _normalize_name_for_match(sender_name)
         pending = conn.execute(
-            "SELECT id, sender_name, file_name FROM file_events "
-            "WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file' "
+            "SELECT id, sender_name, file_name, text_content FROM file_events "
+            "WHERE tagged = 1 AND downloaded = 0 "
             "AND LOWER(TRIM(sender_name)) = ?",
             (normalized,)
         ).fetchall()
     else:
         pending = conn.execute(
-            "SELECT id, sender_name, file_name FROM file_events WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file'"
+            "SELECT id, sender_name, file_name, text_content FROM file_events WHERE tagged = 1 AND downloaded = 0"
         ).fetchall()
 
     if not pending:
         conn.close()
         if not sender_name:
-            return "ไม่มีไฟล์ค้างให้ติ๊กครับ"
-        # name didn't match anyone with a pending file - show the actual
+            return "ไม่มีรายการค้างให้ปิดครับ"
+        # name didn't match anyone with a pending item - show the actual
         # pending names so the user can see the real spelling and retry,
         # instead of a generic message that reads like "already done".
         conn2 = db()
         others = conn2.execute(
-            "SELECT DISTINCT sender_name FROM file_events WHERE tagged = 1 AND downloaded = 0 AND event_type = 'file'"
+            "SELECT DISTINCT sender_name FROM file_events WHERE tagged = 1 AND downloaded = 0"
         ).fetchall()
         conn2.close()
         if others:
             names = ", ".join(r[0] for r in others)
-            return (f'ไม่พบชื่อ "{sender_name}" ในรายการที่ยังไม่โหลดครับ ชื่อที่พิมพ์อาจไม่ตรงกับในระบบเป๊ะๆ '
-                     f'(เช่น มี < > ติดมาด้วย)\nรายชื่อที่ยังมีไฟล์ค้างอยู่ตอนนี้: {names}')
-        return f'ไม่มีไฟล์ค้างให้ติ๊กครับ (ของ "{sender_name}")'
+            return (f'ไม่พบชื่อ "{sender_name}" ในรายการที่ยังค้างอยู่ครับ ชื่อที่พิมพ์อาจไม่ตรงกับในระบบเป๊ะๆ '
+                     f'(เช่น มี < > ติดมาด้วย)\nรายชื่อที่ยังมีรายการค้างอยู่ตอนนี้: {names}')
+        return f'ไม่มีรายการค้างให้ปิดครับ (ของ "{sender_name}")'
 
     ids = [row[0] for row in pending]
     now_iso = bkk_now().isoformat()
@@ -974,9 +989,10 @@ def mark_downloaded(sender_name=None, marked_by_name=None):
     conn.close()
 
     target = f"ของ {sender_name} " if sender_name else ""
-    lines = [f"ติ๊กว่าโหลดแล้ว {target}{len(pending)} ไฟล์ ✅", ""]
-    for _, sname, fname in pending:
-        lines.append(f"✅ {fname} ({sname})" if not sender_name else f"✅ {fname}")
+    lines = [f"ปิดสถานะ {target}{len(pending)} รายการแล้ว ✅", ""]
+    for _, sname, fname, tcontent in pending:
+        label = _item_label(fname, tcontent)
+        lines.append(f"✅ {label} ({sname})" if not sender_name else f"✅ {label}")
     return "\n".join(lines)
 
 # ---------- Daily backend report (CSV) ----------
@@ -1003,7 +1019,7 @@ def build_daily_report_rows(date=None):
            FROM file_events
            WHERE tagged = 1 AND (
                (sent_at BETWEEN ? AND ?)
-               OR (event_type = 'file' AND downloaded = 0 AND sent_at < ?)
+               OR (downloaded = 0 AND sent_at < ?)
            )
            ORDER BY group_name, sender_name, sent_at""",
         (start, end, start)
@@ -1022,7 +1038,7 @@ def build_daily_report_rows(date=None):
             "ชื่อไฟล์": file_name or "",
             "ข้อความ": (text_content or "").replace("\n", " "),
             "วันที่ส่งจริง": sent_dt.strftime("%d/%m/%Y %H:%M"),
-            "สถานะ": ("โหลดแล้ว" if downloaded else "ยังไม่โหลด") if event_type == "file" else "-",
+            "สถานะ": "ปิดแล้ว" if downloaded else "ยังไม่ปิด",
             "โหลดโดย": downloaded_by or "",
             "วันที่โหลด": datetime.datetime.fromisoformat(downloaded_at).strftime("%d/%m/%Y %H:%M") if downloaded_at else "",
             "หมายเหตุ": "ยกยอดจากวันก่อน" if carried_over else "ใหม่วันนี้",
@@ -1095,9 +1111,9 @@ def build_overdue_flex():
 
     conn = db()
     rows = conn.execute(
-        """SELECT group_name, sender_name, file_name, text_content, sent_at, mention_spans
+        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, mention_spans
            FROM file_events
-           WHERE event_type = 'file' AND tagged = 1 AND downloaded = 0 AND sent_at < ?
+           WHERE tagged = 1 AND downloaded = 0 AND sent_at < ?
            ORDER BY group_name, sender_name, sent_at""",
         (today_start,)
     ).fetchall()
@@ -1107,31 +1123,36 @@ def build_overdue_flex():
         return (None, None)
 
     by_group = {}
-    for group_name, sender_name, file_name, text_content, sent_at, mention_spans in rows:
+    for group_name, sender_name, event_type, file_name, text_content, sent_at, mention_spans in rows:
         by_group.setdefault(group_name, {}).setdefault(sender_name, []).append(
-            (file_name, text_content, sent_at, mention_spans)
+            (event_type, file_name, text_content, sent_at, mention_spans)
         )
 
     txt = flex_txt
-    body = [txt("⚠️ ไฟล์ค้างจากวันก่อนหน้า (ยังไม่โหลด)", weight="bold", size="lg", color=OVERDUE_COLOR)]
-    body.append(txt(f"ทั้งหมด {len(rows)} ไฟล์", size="sm", color=OVERDUE_COLOR, margin="xs"))
+    body = [txt("⚠️ รายการค้างจากวันก่อนหน้า (ยังไม่ปิดสถานะ)", weight="bold", size="lg", color=OVERDUE_COLOR)]
+    body.append(txt(f"ทั้งหมด {len(rows)} รายการ", size="sm", color=OVERDUE_COLOR, margin="xs"))
     body.append({"type": "separator", "margin": "md"})
 
     for group_name, by_sender in by_group.items():
         body.append(group_name_badge(group_name))
         for sender_name, items in by_sender.items():
             body.append(txt(f"👤 {sender_name}", weight="bold", size="sm", color="#222222", margin="sm"))
-            for file_name, text_content, sent_at, mention_spans in items:
+            for event_type, file_name, text_content, sent_at, mention_spans in items:
                 date_str = datetime.datetime.fromisoformat(sent_at).strftime("%d/%m %H:%M")
-                body.append(two_tone_text(f"🔴 {file_name}", OVERDUE_COLOR, f"  ({date_str} น.)",
-                                           size="sm", margin="xs"))
-                if text_content:
+                if event_type == "file":
+                    body.append(two_tone_text(f"🔴 {file_name}", OVERDUE_COLOR, f"  ({date_str} น.)",
+                                               size="sm", margin="xs"))
+                    if text_content:
+                        body.append(message_text_component(
+                            "💬 ", text_content, mention_spans, size="xs", margin="xs"
+                        ))
+                else:
                     body.append(message_text_component(
-                        "💬 ", text_content, mention_spans, size="xs", margin="xs"
+                        "🔴 💬 ", text_content, mention_spans, suffix=f"  ({date_str} น.)", size="sm", margin="xs"
                     ))
 
     body.append({"type": "separator", "margin": "lg"})
-    body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ "✅ <ชื่อคน>" เพื่อติ๊กเฉพาะคนนั้น',
+    body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อปิดสถานะทั้งหมด หรือ "✅ <ชื่อคน>" เพื่อปิดเฉพาะคนนั้น',
                      size="xs", color="#888888", margin="md"))
 
     contents = {
@@ -1143,7 +1164,7 @@ def build_overdue_flex():
             "contents": body
         }
     }
-    alt_text = f"⚠️ มีไฟล์ค้างจากวันก่อนหน้ายังไม่โหลด {len(rows)} ไฟล์"
+    alt_text = f"⚠️ มีรายการค้างจากวันก่อนหน้ายังไม่ปิดสถานะ {len(rows)} รายการ"
     return (alt_text, contents)
 
 def send_overdue_digest():
