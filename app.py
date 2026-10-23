@@ -570,37 +570,49 @@ INSPECTION_SUBJECT_COLOR = "#212121"     # เรื่อง
 INSPECTION_DATE_COLOR = "#2E7D32"        # วันที่เอกสาร
 INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ
 
+INSPECTION_MAX_ITEMS = 30  # safety cap so the flex message doesn't blow past LINE's size limit
+
 def build_inspection_carousel_flex(items):
-    """One bubble per document, fields stacked vertically with an emoji +
-    label line followed by the value, each field color-coded. Mirrors the
-    flex_txt-based style used by the other builders in this file."""
+    """A SINGLE bubble listing every document stacked vertically, one block
+    per document (separated by a divider line), each block's own fields
+    also stacked vertically as an emoji + label line followed by the value,
+    color-coded per field. Deliberately not a LINE "carousel" (separate
+    swipeable cards) - with everything in one bubble, the whole list reads
+    top-to-bottom in a single scroll instead of needing to swipe sideways
+    between documents."""
     txt = flex_txt
-    bubbles = []
-    for it in items:
-        def field(emoji, label, value, color, value_size="md", bold=False):
-            return {
-                "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
-                "contents": [
-                    txt(f"{emoji} {label}", size="xs", color=INSPECTION_LABEL_COLOR, weight="bold"),
-                    txt(value, size=value_size, color=color, wrap=True, weight="bold" if bold else "regular"),
-                ]
-            }
-        body = [
-            field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, value_size="xl", bold=True),
-            {"type": "separator", "margin": "md"},
-            field("🔖", "Code", it["doc_number"], INSPECTION_CODE_COLOR),
-            field("📝", "เรื่อง", it["subject"], INSPECTION_SUBJECT_COLOR, value_size="sm"),
-            field("📅", "วันที่เอกสาร", it["date"], INSPECTION_DATE_COLOR, value_size="sm"),
-        ]
+
+    def field(emoji, label, value, color, value_size="md", bold=False):
+        return {
+            "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
+            "contents": [
+                txt(f"{emoji} {label}", size="xs", color=INSPECTION_LABEL_COLOR, weight="bold"),
+                txt(value, size=value_size, color=color, wrap=True, weight="bold" if bold else "regular"),
+            ]
+        }
+
+    shown = items[:INSPECTION_MAX_ITEMS]
+    body = []
+    for i, it in enumerate(shown):
+        if i > 0:
+            body.append({"type": "separator", "margin": "xl"})
+        body.append(field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, value_size="lg", bold=True))
+        body.append(field("🔖", "Code", it["doc_number"], INSPECTION_CODE_COLOR))
+        body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_SUBJECT_COLOR, value_size="sm"))
+        body.append(field("📅", "วันที่เอกสาร", it["date"], INSPECTION_DATE_COLOR, value_size="sm"))
         if it.get("extra_note"):
             body.append(field("🧱", "วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ", it["extra_note"],
                                INSPECTION_EXTRA_NOTE_COLOR, value_size="sm"))
-        bubbles.append({
-            "type": "bubble",
-            "size": "kilo",
-            "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body, "paddingAll": "lg"},
-        })
-    contents = {"type": "carousel", "contents": bubbles}
+
+    if len(items) > INSPECTION_MAX_ITEMS:
+        body.append({"type": "separator", "margin": "xl"})
+        body.append(txt(f"… มีอีก {len(items) - INSPECTION_MAX_ITEMS} รายการที่ไม่ได้แสดง",
+                         size="xs", color=INSPECTION_LABEL_COLOR, margin="md"))
+
+    contents = {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body, "paddingAll": "lg"},
+    }
     alt_text = f"เอกสารตรวจสอบ {len(items)} รายการ"
     return alt_text, contents
 
