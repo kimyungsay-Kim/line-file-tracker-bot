@@ -265,13 +265,13 @@ def reply_flex_and_text(reply_token, alt_text, contents_dict, text):
             ]
         ))
 
-def reply_text_flex_text(reply_token, lead_text, alt_text, contents_dict, trailing_text):
+def reply_text_flex_text(reply_token, lead_alt_text, lead_contents, alt_text, contents_dict, trailing_text):
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.reply_message(ReplyMessageRequest(
             reply_token=reply_token,
             messages=[
-                TextMessage(text=lead_text),
+                FlexMessage(alt_text=lead_alt_text, contents=FlexContainer.from_dict(lead_contents)),
                 FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict)),
                 TextMessage(text=trailing_text),
             ]
@@ -279,15 +279,15 @@ def reply_text_flex_text(reply_token, lead_text, alt_text, contents_dict, traili
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_text, mention_text="โปรดตรวจสอบครับ"):
-    """Pushes a lead announcement text, then the Flex Carousel, then an
-    '@All'-mention text message, to the given group. Uses a raw HTTP call
-    instead of the messaging SDK's typed message classes because the
-    installed line-bot-sdk version here doesn't expose LINE's textV2/mention
-    payload - this builds that payload directly, per LINE's documented
-    format."""
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบครับ"):
+    """Pushes a lead announcement Flex (so part of its text can be colored),
+    then the documents Flex, then an '@All'-mention text message, to the
+    given group. Uses a raw HTTP call instead of the messaging SDK's typed
+    message classes because the installed line-bot-sdk version here doesn't
+    expose LINE's textV2/mention payload - this builds that payload
+    directly, per LINE's documented format."""
     messages = [
-        {"type": "text", "text": lead_text},
+        {"type": "flex", "altText": lead_alt_text, "contents": lead_contents},
         {"type": "flex", "altText": flex_alt_text, "contents": flex_contents},
         {
             "type": "textV2",
@@ -382,10 +382,11 @@ def handle_text(event):
             parsed_items = parse_inspection_paste(text)
             if parsed_items:
                 alt_text, contents = build_inspection_carousel_flex(parsed_items)
+                lead_alt_text, lead_contents = build_inspection_announce_flex(len(parsed_items))
                 save_inspection_preview(user_id, parsed_items)
                 reply_text_flex_text(
                     event.reply_token,
-                    inspection_announce_text(len(parsed_items)),
+                    lead_alt_text, lead_contents,
                     alt_text, contents,
                     'ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
                 )
@@ -531,8 +532,28 @@ def parse_inspection_paste(text):
         })
     return items
 
-def inspection_announce_text(n):
-    return f"📋✨ แจ้งข้อมูลเอกสาร Request จาก บมจ.พรีบิลท์ (PB) จำนวน {n} ฉบับ ดังนี้ครับ 📑"
+INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR = "#1565C0"  # the "จำนวน N ฉบับ" count phrase
+
+def build_inspection_announce_flex(n):
+    """A single-line Flex bubble (not a plain TextMessage) so the "จำนวน N
+    ฉบับ" count phrase can be colored - LINE's plain text messages have no
+    per-span styling, only Flex text components do."""
+    contents = {
+        "type": "bubble",
+        "body": {
+            "type": "box", "layout": "vertical", "paddingAll": "lg",
+            "contents": [{
+                "type": "text", "wrap": True, "contents": [
+                    {"type": "span", "text": "📋✨ แจ้งข้อมูลเอกสาร Request จาก บมจ.พรีบิลท์ (PB) "},
+                    {"type": "span", "text": f"จำนวน {n} ฉบับ",
+                     "color": INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR, "weight": "bold"},
+                    {"type": "span", "text": " ดังนี้ครับ 📑"},
+                ]
+            }]
+        }
+    }
+    alt_text = f"แจ้งข้อมูลเอกสาร Request จาก PB จำนวน {n} ฉบับ"
+    return alt_text, contents
 
 def save_inspection_preview(user_id, items):
     conn = db()
@@ -567,6 +588,7 @@ INSPECTION_LABEL_COLOR = "#90A4AE"
 INSPECTION_VALUE_COLOR = "#000000"       # Code / เรื่อง / วันที่ส่งเอกสารเข้าระบบ - plain black
 INSPECTION_DOCNUM_COLOR = "#1E88E5"      # เลขที่เอกสาร (เช่น AR-333) - kept colored
 INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ - kept colored
+INSPECTION_SEPARATOR_COLOR = "#0D47A1"   # divider line between documents - dark blue
 
 INSPECTION_MAX_ITEMS = 30  # safety cap so the flex message doesn't blow past LINE's size limit
 
@@ -593,7 +615,7 @@ def build_inspection_carousel_flex(items):
     body = []
     for i, it in enumerate(shown):
         if i > 0:
-            body.append({"type": "separator", "margin": "xl"})
+            body.append({"type": "separator", "margin": "xl", "color": INSPECTION_SEPARATOR_COLOR})
         body.append(field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, bold=True))
         body.append(field("🔖", "Code", it["doc_number"], INSPECTION_VALUE_COLOR))
         body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_VALUE_COLOR))
@@ -621,8 +643,9 @@ def handle_inspection_confirm(user_id):
     if not INSPECTION_TARGET_GROUP_ID:
         return "ยังไม่ได้ตั้งค่า INSPECTION_TARGET_GROUP_ID ปลายทางครับ แจ้งผู้ดูแลระบบด้วย"
     alt_text, contents = build_inspection_carousel_flex(items)
+    lead_alt_text, lead_contents = build_inspection_announce_flex(len(items))
     try:
-        push_mention_all_to_group(INSPECTION_TARGET_GROUP_ID, alt_text, contents, inspection_announce_text(len(items)))
+        push_mention_all_to_group(INSPECTION_TARGET_GROUP_ID, alt_text, contents, lead_alt_text, lead_contents)
     except Exception:
         return "โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือแจ้งผู้ดูแลระบบ"
     clear_inspection_preview(user_id)
