@@ -364,14 +364,20 @@ def handle_text(event):
                 reply(event.reply_token, "ยกเลิกรายการที่รอส่งแล้วครับ")
             return
 
-        parsed_items = parse_inspection_paste(text)
-        if parsed_items is not None:
-            alt_text, contents = build_inspection_carousel_flex(parsed_items)
-            save_inspection_preview(user_id, parsed_items)
-            reply_flex_and_text(
-                event.reply_token, alt_text, contents,
-                f'พบเอกสาร {len(parsed_items)} รายการครับ ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
-            )
+        if "|" in text:
+            parsed_items = parse_inspection_paste(text)
+            if parsed_items:
+                alt_text, contents = build_inspection_carousel_flex(parsed_items)
+                save_inspection_preview(user_id, parsed_items)
+                reply_flex_and_text(
+                    event.reply_token, alt_text, contents,
+                    f'พบเอกสาร {len(parsed_items)} รายการครับ ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
+                )
+            else:
+                reply(event.reply_token,
+                      'รูปแบบไม่ถูกต้องครับ แต่ละบรรทัดต้องมีอย่างน้อย 4 ช่องคั่นด้วย "|" คือ '
+                      'code|เลขที่เอกสาร|เรื่อง|วันที่ เช่น\n'
+                      'AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026')
             return
 
         if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
@@ -477,21 +483,31 @@ def handle_text(event):
 
 # ---------- Inspection document list (paste from Claude in Chrome) ----------
 def parse_inspection_paste(text):
-    """Parses pasted lines in the confirmed "code|doc_number|subject|date"
-    format (one document per line), e.g.:
+    """Parses pasted lines of 4+ pipe-separated fields per document:
+    code|doc_number|subject|date[|extra date/notes...], e.g.:
         AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026
-    Returns a list of {"code", "doc_number", "subject", "date"} dicts, or
-    None if the text doesn't look like this format at all - so the caller
-    falls through to the other 1:1 commands untouched."""
+    Any pipe-separated segments beyond the first 3 are folded into the
+    date/notes field (joined with " / ") instead of rejecting the whole
+    paste - Claude in Chrome sometimes adds a genuinely useful extra date
+    (e.g. a concrete-pour date) past the confirmed 4-field template.
+    Returns a list of {"code", "doc_number", "subject", "date"} dicts.
+    Returns None when NO line contains "|" at all, so a plain command like
+    "สรุป" or "ยกเลิก" still falls through to the other 1:1 commands
+    untouched. If a line DOES contain "|" but is missing a required field,
+    the whole paste is also rejected (None) - the caller then tells the
+    admin so, instead of staying silent."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
+    if not lines or not any("|" in ln for ln in lines):
         return None
     items = []
     for ln in lines:
         parts = [p.strip() for p in ln.split("|")]
-        if len(parts) != 4 or not all(parts):
+        if len(parts) < 4:
             return None
-        code, doc_number, subject, date_str = parts
+        code, doc_number, subject = parts[0], parts[1], parts[2]
+        date_str = " / ".join(p for p in parts[3:] if p)
+        if not code or not doc_number or not subject or not date_str:
+            return None
         items.append({"code": code, "doc_number": doc_number, "subject": subject, "date": date_str})
     return items
 
