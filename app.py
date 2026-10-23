@@ -586,7 +586,8 @@ def clear_inspection_preview(user_id):
 
 INSPECTION_LABEL_COLOR = "#90A4AE"
 INSPECTION_VALUE_COLOR = "#000000"       # Code / เรื่อง / วันที่ส่งเอกสารเข้าระบบ - plain black
-INSPECTION_DOCNUM_COLOR = "#1E88E5"      # เลขที่เอกสาร (เช่น AR-333) - kept colored
+INSPECTION_DOCNUM_COLOR = "#0D47A1"      # เลขที่เอกสาร (เช่น AR-333) - bold, darker blue
+INSPECTION_DOCNUM_BG_COLOR = "#E3F2FD"   # highlighted background behind it
 INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ - kept colored
 INSPECTION_SEPARATOR_COLOR = "#0D47A1"   # divider line between documents - dark blue
 
@@ -611,12 +612,24 @@ def build_inspection_carousel_flex(items):
             ]
         }
 
+    def doc_number_badge(value):
+        """เลขที่เอกสาร gets its own highlighted pill (background color box)
+        instead of the plain field() layout, to stand out as the key value."""
+        return {
+            "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
+            "backgroundColor": INSPECTION_DOCNUM_BG_COLOR, "cornerRadius": "md", "paddingAll": "sm",
+            "contents": [
+                txt("📌 เลขที่เอกสาร", size="xs", color=INSPECTION_LABEL_COLOR, weight="bold"),
+                txt(value, size="xs", color=INSPECTION_DOCNUM_COLOR, wrap=True, weight="bold"),
+            ]
+        }
+
     shown = items[:INSPECTION_MAX_ITEMS]
     body = []
     for i, it in enumerate(shown):
         if i > 0:
             body.append({"type": "separator", "margin": "xl", "color": INSPECTION_SEPARATOR_COLOR})
-        body.append(field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, bold=True))
+        body.append(doc_number_badge(it["code"]))
         body.append(field("🔖", "Code", it["doc_number"], INSPECTION_VALUE_COLOR))
         body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_VALUE_COLOR))
         body.append(field("📅", "วันที่ส่งเอกสารเข้าระบบ", it["date"], INSPECTION_VALUE_COLOR))
