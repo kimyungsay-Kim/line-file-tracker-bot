@@ -1,4 +1,6 @@
 import os
+import io
+import csv
 import json
 import datetime
 from zoneinfo import ZoneInfo
@@ -6,7 +8,7 @@ from zoneinfo import ZoneInfo
 import libsql_client
 import requests
 
-from flask import Flask, request, abort
+from flask import Flask, request, abort, Response
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -42,6 +44,16 @@ TAG_LOOKBACK_MINUTES = int(os.environ.get("TAG_LOOKBACK_MINUTES", "30"))
 # Group that pasted Site Around inspection-document lists get posted to after
 # an admin confirms the preview (see "Inspection document list" below).
 INSPECTION_TARGET_GROUP_ID = os.environ.get("INSPECTION_TARGET_GROUP_ID", "")
+
+# Optional shared secret required as ?key=... on /report/daily.csv (see "Daily
+# backend report" below). Leave unset to allow the report link with no key.
+REPORT_ACCESS_KEY = os.environ.get("REPORT_ACCESS_KEY", "")
+
+# Public base URL of this service (e.g. https://line-file-tracker-bot.onrender.com).
+# Needed to build the report link from the scheduled daily digest job, which
+# runs with no incoming request to read the host from; the 1:1 "รายงาน"
+# command works either way since it can read the host from its own request.
+SERVICE_BASE_URL = os.environ.get("SERVICE_BASE_URL", "").rstrip("/")
 
 # Turso (hosted libSQL/SQLite) - persistent storage, survives redeploys unlike a local
 # sqlite file on Render's free tier (which has no disk and resets on every deploy).
@@ -382,6 +394,10 @@ def handle_text(event):
             reply(event.reply_token, mark_downloaded(
                 text[2:].strip(), marked_by_name=get_profile_name(None, source.user_id)
             ))
+        elif text in ("รายงาน", "report", "export"):
+            reply(event.reply_token,
+                  f"ดาวน์โหลดรายงานวันนี้ (CSV เปิดด้วย Excel ได้เลย):\n{daily_report_url()}\n\n"
+                  f"ดูวันอื่นได้โดยเติม ?date=YYYY-MM-DD ต่อท้ายลิงก์")
         return
 
     if source.type != "group":
@@ -704,7 +720,7 @@ def build_summary_flex(date=None, user_id=None):
         """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at, tagged, downloaded, mention_spans, tagged_user_ids, downloaded_by
            FROM file_events
            WHERE tagged = 1 AND (
-               (sent_at BETWEEN ? AND ?)
+               (sent_at BETWEEN ? AND ? AND NOT (event_type = 'file' AND downloaded = 1))
                OR (event_type = 'file' AND downloaded = 0 AND sent_at < ?)
            )
            ORDER BY group_name, sender_name, sent_at""",
@@ -831,6 +847,93 @@ def mark_downloaded(sender_name=None, marked_by_name=None):
         lines.append(f"✅ {fname} ({sname})" if not sender_name else f"✅ {fname}")
     return "\n".join(lines)
 
+# ---------- Daily backend report (CSV) ----------
+REPORT_CSV_COLUMNS = [
+    "วันที่สรุป", "กลุ่ม", "ผู้ส่ง", "ประเภท", "ชื่อไฟล์", "ข้อความ",
+    "วันที่ส่งจริง", "สถานะ", "โหลดโดย", "วันที่โหลด", "หมายเหตุ",
+]
+
+def build_daily_report_rows(date=None):
+    """One row per tagged event relevant to `date`: everything actually sent
+    ON that date (file or message, downloaded or not - a full record, unlike
+    the LINE summary which hides downloaded items), plus any FILE event
+    tagged on an earlier date that's still not downloaded as of `date`
+    (carried forward, same as the LINE digest's overdue list, flagged in
+    the "หมายเหตุ" column instead of colored red)."""
+    date = date or bkk_today()
+    start = datetime.datetime.combine(date, datetime.time.min).isoformat()
+    end = datetime.datetime.combine(date, datetime.time.max).isoformat()
+
+    conn = db()
+    rows = conn.execute(
+        """SELECT group_name, sender_name, event_type, file_name, text_content, sent_at,
+                  downloaded, downloaded_at, downloaded_by
+           FROM file_events
+           WHERE tagged = 1 AND (
+               (sent_at BETWEEN ? AND ?)
+               OR (event_type = 'file' AND downloaded = 0 AND sent_at < ?)
+           )
+           ORDER BY group_name, sender_name, sent_at""",
+        (start, end, start)
+    ).fetchall()
+    conn.close()
+
+    out = []
+    for group_name, sender_name, event_type, file_name, text_content, sent_at, downloaded, downloaded_at, downloaded_by in rows:
+        sent_dt = datetime.datetime.fromisoformat(sent_at)
+        carried_over = sent_dt.date() < date
+        out.append({
+            "วันที่สรุป": date.strftime("%d/%m/%Y"),
+            "กลุ่ม": group_name,
+            "ผู้ส่ง": sender_name,
+            "ประเภท": "ไฟล์" if event_type == "file" else "ข้อความ",
+            "ชื่อไฟล์": file_name or "",
+            "ข้อความ": (text_content or "").replace("\n", " "),
+            "วันที่ส่งจริง": sent_dt.strftime("%d/%m/%Y %H:%M"),
+            "สถานะ": ("โหลดแล้ว" if downloaded else "ยังไม่โหลด") if event_type == "file" else "-",
+            "โหลดโดย": downloaded_by or "",
+            "วันที่โหลด": datetime.datetime.fromisoformat(downloaded_at).strftime("%d/%m/%Y %H:%M") if downloaded_at else "",
+            "หมายเหตุ": "ยกยอดจากวันก่อน" if carried_over else "ใหม่วันนี้",
+        })
+    return out
+
+def build_daily_report_csv(date=None):
+    rows = build_daily_report_rows(date)
+    buf = io.StringIO()
+    buf.write("﻿")  # BOM so Excel opens the Thai text as UTF-8 instead of mangling it
+    writer = csv.DictWriter(buf, fieldnames=REPORT_CSV_COLUMNS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+@app.route("/report/daily.csv", methods=["GET"])
+def report_daily_csv():
+    if REPORT_ACCESS_KEY and request.args.get("key", "") != REPORT_ACCESS_KEY:
+        abort(403)
+    date_str = request.args.get("date", "")
+    try:
+        date = datetime.date.fromisoformat(date_str) if date_str else bkk_today()
+    except ValueError:
+        abort(400, "date must be YYYY-MM-DD")
+    return Response(
+        build_daily_report_csv(date),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="report_{date.isoformat()}.csv"'}
+    )
+
+def daily_report_url(date=None):
+    date = date or bkk_today()
+    base = SERVICE_BASE_URL
+    if not base:
+        try:
+            base = request.host_url.rstrip("/")
+        except RuntimeError:
+            return None  # no SERVICE_BASE_URL set and no request context (e.g. the scheduler)
+    url = f"{base}/report/daily.csv?date={date.isoformat()}"
+    if REPORT_ACCESS_KEY:
+        url += f"&key={REPORT_ACCESS_KEY}"
+    return url
+
 # ---------- Daily digest ----------
 def send_daily_digest():
     # shared digest: every tracked admin gets the same full summary
@@ -843,6 +946,11 @@ def send_daily_digest():
             push_to(uid, alt_text)
         else:
             push_flex_to(uid, alt_text, contents)
+
+    report_url = daily_report_url()
+    if report_url:
+        for uid in recipients:
+            push_to(uid, f"📄 รายงานข้อมูลวันนี้ (CSV เปิดด้วย Excel ได้เลย):\n{report_url}")
 
 # ---------- Overdue (leftover from previous days) morning digest ----------
 OVERDUE_COLOR = "#C62828"  # red

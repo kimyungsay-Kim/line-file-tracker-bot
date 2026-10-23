@@ -32,3 +32,7 @@ services:
         sync: false
       - key: INSPECTION_TARGET_GROUP_ID
         sync: false
+      - key: REPORT_ACCESS_KEY
+        sync: false
+      - key: SERVICE_BASE_URL
+        value: https://line-file-tracker-bot.onrender.com
