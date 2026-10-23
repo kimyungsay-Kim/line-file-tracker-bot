@@ -265,19 +265,33 @@ def reply_flex_and_text(reply_token, alt_text, contents_dict, text):
             ]
         ))
 
+def reply_text_flex_text(reply_token, lead_text, alt_text, contents_dict, trailing_text):
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[
+                TextMessage(text=lead_text),
+                FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict)),
+                TextMessage(text=trailing_text),
+            ]
+        ))
+
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_text="📋 เอกสารตรวจสอบใหม่"):
-    """Pushes the Flex Carousel followed by an '@All'-mention text message to
-    the given group. Uses a raw HTTP call instead of the messaging SDK's
-    typed message classes because the installed line-bot-sdk version here
-    doesn't expose LINE's textV2/mention payload - this builds that payload
-    directly, per LINE's documented format."""
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_text, mention_text="โปรดตรวจสอบครับ"):
+    """Pushes a lead announcement text, then the Flex Carousel, then an
+    '@All'-mention text message, to the given group. Uses a raw HTTP call
+    instead of the messaging SDK's typed message classes because the
+    installed line-bot-sdk version here doesn't expose LINE's textV2/mention
+    payload - this builds that payload directly, per LINE's documented
+    format."""
     messages = [
+        {"type": "text", "text": lead_text},
         {"type": "flex", "altText": flex_alt_text, "contents": flex_contents},
         {
             "type": "textV2",
-            "text": f"{lead_text} {{user1}} โปรดตรวจสอบครับ",
+            "text": f"{{user1}} {mention_text}",
             "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}},
         },
     ]
@@ -369,9 +383,11 @@ def handle_text(event):
             if parsed_items:
                 alt_text, contents = build_inspection_carousel_flex(parsed_items)
                 save_inspection_preview(user_id, parsed_items)
-                reply_flex_and_text(
-                    event.reply_token, alt_text, contents,
-                    f'พบเอกสาร {len(parsed_items)} รายการครับ ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
+                reply_text_flex_text(
+                    event.reply_token,
+                    inspection_announce_text(len(parsed_items)),
+                    alt_text, contents,
+                    'ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
                 )
             else:
                 reply(event.reply_token,
@@ -486,11 +502,12 @@ def parse_inspection_paste(text):
     """Parses pasted lines of 4+ pipe-separated fields per document:
     code|doc_number|subject|date[|extra date/notes...], e.g.:
         AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026
-    Any pipe-separated segments beyond the first 3 are folded into the
-    date/notes field (joined with " / ") instead of rejecting the whole
-    paste - Claude in Chrome sometimes adds a genuinely useful extra date
-    (e.g. a concrete-pour date) past the confirmed 4-field template.
-    Returns a list of {"code", "doc_number", "subject", "date"} dicts.
+    Any pipe-separated segments beyond the first 4 are folded into a
+    separate extra_note field (joined with " / ") instead of rejecting the
+    whole paste - Claude in Chrome sometimes adds a genuinely useful extra
+    date (e.g. a concrete-pour date) past the confirmed 4-field template.
+    Returns a list of {"code", "doc_number", "subject", "date", "extra_note"}
+    dicts (extra_note is "" when the line had no 5th+ field).
     Returns None when NO line contains "|" at all, so a plain command like
     "สรุป" or "ยกเลิก" still falls through to the other 1:1 commands
     untouched. If a line DOES contain "|" but is missing a required field,
@@ -504,12 +521,18 @@ def parse_inspection_paste(text):
         parts = [p.strip() for p in ln.split("|")]
         if len(parts) < 4:
             return None
-        code, doc_number, subject = parts[0], parts[1], parts[2]
-        date_str = " / ".join(p for p in parts[3:] if p)
+        code, doc_number, subject, date_str = parts[0], parts[1], parts[2], parts[3]
+        extra_note = " / ".join(p for p in parts[4:] if p)
         if not code or not doc_number or not subject or not date_str:
             return None
-        items.append({"code": code, "doc_number": doc_number, "subject": subject, "date": date_str})
+        items.append({
+            "code": code, "doc_number": doc_number, "subject": subject,
+            "date": date_str, "extra_note": extra_note,
+        })
     return items
+
+def inspection_announce_text(n):
+    return f"📋✨ แจ้งข้อมูลเอกสาร Request จาก บมจ.พรีบิลท์ (PB) จำนวน {n} ฉบับ ดังนี้ครับ 📑"
 
 def save_inspection_preview(user_id, items):
     conn = db()
@@ -540,35 +563,42 @@ def clear_inspection_preview(user_id):
     conn.commit()
     conn.close()
 
-INSPECTION_CODE_COLOR = "#1E88E5"
-INSPECTION_LABEL_COLOR = "#888888"
-INSPECTION_VALUE_COLOR = "#111111"
+INSPECTION_LABEL_COLOR = "#90A4AE"
+INSPECTION_DOCNUM_COLOR = "#1E88E5"      # เลขที่เอกสาร (เช่น AR-333)
+INSPECTION_CODE_COLOR = "#6A1B9A"        # Code (เช่น RIH-I02222)
+INSPECTION_SUBJECT_COLOR = "#212121"     # เรื่อง
+INSPECTION_DATE_COLOR = "#2E7D32"        # วันที่เอกสาร
+INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ
 
 def build_inspection_carousel_flex(items):
-    """One bubble per document: code (title), doc_number/subject/date (fields).
-    Mirrors the flex_txt-based style used by the other builders in this file."""
+    """One bubble per document, fields stacked vertically with an emoji +
+    label line followed by the value, each field color-coded. Mirrors the
+    flex_txt-based style used by the other builders in this file."""
     txt = flex_txt
     bubbles = []
     for it in items:
-        def field(label, value):
+        def field(emoji, label, value, color, value_size="md", bold=False):
             return {
-                "type": "box", "layout": "baseline", "margin": "sm",
+                "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
                 "contents": [
-                    txt(label, size="xs", color=INSPECTION_LABEL_COLOR, flex=3),
-                    txt(value, size="sm", color=INSPECTION_VALUE_COLOR, flex=6, wrap=True),
+                    txt(f"{emoji} {label}", size="xs", color=INSPECTION_LABEL_COLOR, weight="bold"),
+                    txt(value, size=value_size, color=color, wrap=True, weight="bold" if bold else "regular"),
                 ]
             }
         body = [
-            txt(it["code"], weight="bold", size="lg", color=INSPECTION_CODE_COLOR),
+            field("📌", "เลขที่เอกสาร", it["code"], INSPECTION_DOCNUM_COLOR, value_size="xl", bold=True),
             {"type": "separator", "margin": "md"},
-            field("เลขที่เอกสาร", it["doc_number"]),
-            field("เรื่อง", it["subject"]),
-            field("วันที่", it["date"]),
+            field("🔖", "Code", it["doc_number"], INSPECTION_CODE_COLOR),
+            field("📝", "เรื่อง", it["subject"], INSPECTION_SUBJECT_COLOR, value_size="sm"),
+            field("📅", "วันที่เอกสาร", it["date"], INSPECTION_DATE_COLOR, value_size="sm"),
         ]
+        if it.get("extra_note"):
+            body.append(field("🧱", "วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ", it["extra_note"],
+                               INSPECTION_EXTRA_NOTE_COLOR, value_size="sm"))
         bubbles.append({
             "type": "bubble",
             "size": "kilo",
-            "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body},
+            "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body, "paddingAll": "lg"},
         })
     contents = {"type": "carousel", "contents": bubbles}
     alt_text = f"เอกสารตรวจสอบ {len(items)} รายการ"
@@ -582,7 +612,7 @@ def handle_inspection_confirm(user_id):
         return "ยังไม่ได้ตั้งค่า INSPECTION_TARGET_GROUP_ID ปลายทางครับ แจ้งผู้ดูแลระบบด้วย"
     alt_text, contents = build_inspection_carousel_flex(items)
     try:
-        push_mention_all_to_group(INSPECTION_TARGET_GROUP_ID, alt_text, contents)
+        push_mention_all_to_group(INSPECTION_TARGET_GROUP_ID, alt_text, contents, inspection_announce_text(len(items)))
     except Exception:
         return "โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือแจ้งผู้ดูแลระบบ"
     clear_inspection_preview(user_id)
