@@ -1087,7 +1087,7 @@ REPORT_XLSX_COLUMNS = (
     + [COL_RECHECK, COL_RECHECK_RESULT]
     + REPORT_CSV_COLUMNS[8:]
 )  # ... "สถานะ", Recheck, ผลตรวจสอบ, "โหลดโดย", ...
-REPORT_COL_WIDTHS = [12, 26, 16, 10, 40, 42, 18, 12, 10, 14, 14, 18, 18]
+REPORT_COL_WIDTHS = [12, 26, 16, 10, 40, 42, 18, 12, 13, 14, 14, 18, 18]
 
 NAVY = "1F3864"
 TEAL = "0B6E4F"
@@ -1196,11 +1196,13 @@ def build_daily_report_xlsx(date=None):
                     # Plain text cell (not boolean - Excel ignores custom
                     # number formats on TRUE/FALSE values and always shows
                     # the literal word, so a tickbox glyph via number_format
-                    # doesn't work). Blank = unticked; "✓" = ticked, picked
-                    # from the cell's dropdown (see DataValidation below).
-                    cell = ws.cell(row=r_idx, column=col_i, value=None)
-                    cell.font = Font(size=14, bold=True, color=GREEN_TXT)
-                    cell.fill = PatternFill("solid", fgColor="FFFFFF")
+                    # doesn't work). Default "☐" = unticked; pick "✓" from
+                    # the cell's dropdown to tick it (see DataValidation
+                    # below) - conditional formatting turns it green once
+                    # ticked, so it reads like a toggle button.
+                    cell = ws.cell(row=r_idx, column=col_i, value="☐")
+                    cell.font = Font(size=16, bold=True, color="9E9E9E")
+                    cell.fill = PatternFill("solid", fgColor="FFFDE7")
                     cell.border = Border(
                         left=Side(style="medium", color=AMBER_TXT), right=Side(style="medium", color=AMBER_TXT),
                         top=Side(style="medium", color=AMBER_TXT), bottom=Side(style="medium", color=AMBER_TXT),
@@ -1236,6 +1238,7 @@ def build_daily_report_xlsx(date=None):
                     cell.font = Font(bold=True, color=ORANGE_TXT)
                 elif col_name == "วันที่สรุป" or col_name == "วันที่ส่งจริง" or col_name == "วันที่โหลด":
                     cell.font = Font(color=GREY_TXT)
+            ws.row_dimensions[r_idx].height = 22
             r_idx += 1
 
     if total == 0:
@@ -1250,16 +1253,26 @@ def build_daily_report_xlsx(date=None):
         recheck_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK) + 1)
         result_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK_RESULT) + 1)
 
-        # Click-to-tick dropdown on each Recheck cell: click the cell, pick
-        # "✓" from the dropdown arrow to tick it, press Delete to untick.
+        # Click-to-toggle dropdown on each Recheck cell: click the cell, pick
+        # "✓" (ticked) or "☐" (unticked) from the dropdown arrow - a single
+        # pick swaps between the two, so it behaves like a toggle switch.
         dv = DataValidation(
-            type="list", formula1='"✓"', allow_blank=True,
+            type="list", formula1='"✓,☐"', allow_blank=True,
             showInputMessage=True, showDropDown=False,
         )
         dv.promptTitle = "Recheck"
-        dv.prompt = "คลิกลูกศรแล้วเลือก ✓ เพื่อติ๊ก, กด Delete เพื่อยกเลิกติ๊ก"
-        dv.add(f"{recheck_col_letter}{header_row + 1}:{recheck_col_letter}{last_data_row}")
+        dv.prompt = "คลิกลูกศรแล้วเลือก ✓ เพื่อติ๊ก หรือ ☐ เพื่อยกเลิกติ๊ก"
+        recheck_range = f"{recheck_col_letter}{header_row + 1}:{recheck_col_letter}{last_data_row}"
+        dv.add(recheck_range)
         ws.add_data_validation(dv)
+
+        # Recheck cell itself turns green/bold once ticked, so it reads
+        # like a pressed toggle button rather than a static dropdown.
+        ws.conditional_formatting.add(
+            recheck_range,
+            CellIsRule(operator="equal", formula=['"✓"'],
+                       fill=PatternFill("solid", fgColor=GREEN_BG), font=Font(bold=True, size=16, color=GREEN_TXT))
+        )
 
         # Color the formula result green/red once Excel evaluates it.
         result_range = f"{result_col_letter}{header_row + 1}:{result_col_letter}{last_data_row}"
