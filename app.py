@@ -1193,25 +1193,34 @@ def build_daily_report_xlsx(date=None):
             recheck_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK) + 1)
             for col_i, col_name in enumerate(REPORT_XLSX_COLUMNS, start=1):
                 if col_name == COL_RECHECK:
-                    cell = ws.cell(row=r_idx, column=col_i, value=False)
-                    # Boolean cell shown as a tickbox glyph: 1 (TRUE) -> ☑, 0 (FALSE) -> ☐.
-                    cell.number_format = '"☑";;"☐"'
-                    cell.font = Font(size=13, bold=True, color=AMBER_TXT)
+                    # Plain text cell (not boolean - Excel ignores custom
+                    # number formats on TRUE/FALSE values and always shows
+                    # the literal word, so a tickbox glyph via number_format
+                    # doesn't work). Blank = unticked; "✓" = ticked, picked
+                    # from the cell's dropdown (see DataValidation below).
+                    cell = ws.cell(row=r_idx, column=col_i, value=None)
+                    cell.font = Font(size=14, bold=True, color=GREEN_TXT)
+                    cell.fill = PatternFill("solid", fgColor="FFFFFF")
+                    cell.border = Border(
+                        left=Side(style="medium", color=AMBER_TXT), right=Side(style="medium", color=AMBER_TXT),
+                        top=Side(style="medium", color=AMBER_TXT), bottom=Side(style="medium", color=AMBER_TXT),
+                    )
                 elif col_name == COL_RECHECK_RESULT:
                     cell = ws.cell(
                         row=r_idx, column=col_i,
-                        value=f'=IF({recheck_col_letter}{r_idx}=({status_col_letter}{r_idx}="ปิดแล้ว"),"ตรงกัน","ไม่ตรงกัน")'
+                        value=f'=IF(({recheck_col_letter}{r_idx}="✓")=({status_col_letter}{r_idx}="ปิดแล้ว"),"ตรงกัน","ไม่ตรงกัน")'
                     )
                     cell.font = Font(bold=True)
                 else:
                     cell = ws.cell(row=r_idx, column=col_i, value=row_dict[col_name])
 
-                cell.border = CELL_BORDER
+                if col_name != COL_RECHECK:
+                    cell.border = CELL_BORDER
                 cell.alignment = Alignment(
                     horizontal="left", vertical="center",
                     wrap_text=col_name in ("ชื่อไฟล์", "ข้อความ")
                 )
-                if zebra_i % 2 == 1:
+                if zebra_i % 2 == 1 and col_name != COL_RECHECK:
                     cell.fill = PatternFill("solid", fgColor=ZEBRA_BG)
 
                 if col_name in (COL_RECHECK, COL_RECHECK_RESULT):
@@ -1241,9 +1250,14 @@ def build_daily_report_xlsx(date=None):
         recheck_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK) + 1)
         result_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK_RESULT) + 1)
 
-        # Click-to-toggle dropdown on each Recheck cell (TRUE/FALSE), so the
-        # person doesn't have to type - click the cell, pick from the list.
-        dv = DataValidation(type="list", formula1='"TRUE,FALSE"', allow_blank=True)
+        # Click-to-tick dropdown on each Recheck cell: click the cell, pick
+        # "✓" from the dropdown arrow to tick it, press Delete to untick.
+        dv = DataValidation(
+            type="list", formula1='"✓"', allow_blank=True,
+            showInputMessage=True, showDropDown=False,
+        )
+        dv.promptTitle = "Recheck"
+        dv.prompt = "คลิกลูกศรแล้วเลือก ✓ เพื่อติ๊ก, กด Delete เพื่อยกเลิกติ๊ก"
         dv.add(f"{recheck_col_letter}{header_row + 1}:{recheck_col_letter}{last_data_row}")
         ws.add_data_validation(dv)
 
