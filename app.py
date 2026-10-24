@@ -10,6 +10,8 @@ import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.formatting.rule import CellIsRule
 
 from flask import Flask, request, abort, Response
 from linebot.v3 import WebhookHandler
@@ -1074,8 +1076,18 @@ def report_daily_csv():
     )
 
 # ---------- Daily backend report (styled Excel) ----------
-REPORT_XLSX_COLUMNS = REPORT_CSV_COLUMNS
-REPORT_COL_WIDTHS = [12, 26, 16, 10, 40, 42, 18, 12, 14, 18, 18]
+# Two extra columns that exist only in the Excel view (not in the CSV, and
+# not stored in the DB): "Recheck" is a tickbox the person checks by hand
+# after physically verifying the item, and "ผลตรวจสอบ" is a live formula
+# comparing that tick against the "สถานะ" column.
+COL_RECHECK = "Recheck"
+COL_RECHECK_RESULT = "ผลตรวจสอบ"
+REPORT_XLSX_COLUMNS = (
+    REPORT_CSV_COLUMNS[:8]
+    + [COL_RECHECK, COL_RECHECK_RESULT]
+    + REPORT_CSV_COLUMNS[8:]
+)  # ... "สถานะ", Recheck, ผลตรวจสอบ, "โหลดโดย", ...
+REPORT_COL_WIDTHS = [12, 26, 16, 10, 40, 42, 18, 12, 10, 14, 14, 18, 18]
 
 NAVY = "1F3864"
 TEAL = "0B6E4F"
@@ -1089,6 +1101,8 @@ ZEBRA_BG = "F7F9FC"
 BLUE_TXT = "1565C0"
 PURPLE_TXT = "6A1B9A"
 GREY_TXT = "616161"
+AMBER_BG = "FFC107"
+AMBER_TXT = "7A5900"
 
 THIN = Side(style="thin", color="D9D9D9")
 CELL_BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -1145,9 +1159,11 @@ def build_daily_report_xlsx(date=None):
     # --- header row ---
     header_row = 4
     for i, col_name in enumerate(REPORT_XLSX_COLUMNS, start=1):
-        cell = ws.cell(row=header_row, column=i, value=col_name)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor=TEAL)
+        is_manual_col = col_name in (COL_RECHECK, COL_RECHECK_RESULT)
+        header_label = "✔️ Recheck" if col_name == COL_RECHECK else col_name
+        cell = ws.cell(row=header_row, column=i, value=header_label)
+        cell.font = Font(bold=True, color=AMBER_TXT if is_manual_col else "FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=AMBER_BG if is_manual_col else TEAL)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = CELL_BORDER
     ws.row_dimensions[header_row].height = 22
@@ -1173,8 +1189,23 @@ def build_daily_report_xlsx(date=None):
         r_idx += 1
 
         for zebra_i, row_dict in enumerate(by_group[group_name]):
+            status_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index("สถานะ") + 1)
+            recheck_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK) + 1)
             for col_i, col_name in enumerate(REPORT_XLSX_COLUMNS, start=1):
-                cell = ws.cell(row=r_idx, column=col_i, value=row_dict[col_name])
+                if col_name == COL_RECHECK:
+                    cell = ws.cell(row=r_idx, column=col_i, value=False)
+                    # Boolean cell shown as a tickbox glyph: 1 (TRUE) -> ☑, 0 (FALSE) -> ☐.
+                    cell.number_format = '"☑";;"☐"'
+                    cell.font = Font(size=13, bold=True, color=AMBER_TXT)
+                elif col_name == COL_RECHECK_RESULT:
+                    cell = ws.cell(
+                        row=r_idx, column=col_i,
+                        value=f'=IF({recheck_col_letter}{r_idx}=({status_col_letter}{r_idx}="ปิดแล้ว"),"ตรงกัน","ไม่ตรงกัน")'
+                    )
+                    cell.font = Font(bold=True)
+                else:
+                    cell = ws.cell(row=r_idx, column=col_i, value=row_dict[col_name])
+
                 cell.border = CELL_BORDER
                 cell.alignment = Alignment(
                     horizontal="left", vertical="center",
@@ -1183,7 +1214,9 @@ def build_daily_report_xlsx(date=None):
                 if zebra_i % 2 == 1:
                     cell.fill = PatternFill("solid", fgColor=ZEBRA_BG)
 
-                if col_name == "สถานะ":
+                if col_name in (COL_RECHECK, COL_RECHECK_RESULT):
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_name == "สถานะ":
                     cell.font = Font(bold=True, color=GREEN_TXT if row_dict[col_name] == "ปิดแล้ว" else RED_TXT)
                     cell.fill = PatternFill("solid", fgColor=GREEN_BG if row_dict[col_name] == "ปิดแล้ว" else RED_BG)
                     cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -1202,6 +1235,30 @@ def build_daily_report_xlsx(date=None):
         empty_cell.font = Font(italic=True, color=GREY_TXT)
         empty_cell.alignment = Alignment(horizontal="center", vertical="center")
         r_idx += 1
+
+    if total:
+        last_data_row = r_idx - 1
+        recheck_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK) + 1)
+        result_col_letter = get_column_letter(REPORT_XLSX_COLUMNS.index(COL_RECHECK_RESULT) + 1)
+
+        # Click-to-toggle dropdown on each Recheck cell (TRUE/FALSE), so the
+        # person doesn't have to type - click the cell, pick from the list.
+        dv = DataValidation(type="list", formula1='"TRUE,FALSE"', allow_blank=True)
+        dv.add(f"{recheck_col_letter}{header_row + 1}:{recheck_col_letter}{last_data_row}")
+        ws.add_data_validation(dv)
+
+        # Color the formula result green/red once Excel evaluates it.
+        result_range = f"{result_col_letter}{header_row + 1}:{result_col_letter}{last_data_row}"
+        ws.conditional_formatting.add(
+            result_range,
+            CellIsRule(operator="equal", formula=['"ตรงกัน"'],
+                       fill=PatternFill("solid", fgColor=GREEN_BG), font=Font(bold=True, color=GREEN_TXT))
+        )
+        ws.conditional_formatting.add(
+            result_range,
+            CellIsRule(operator="equal", formula=['"ไม่ตรงกัน"'],
+                       fill=PatternFill("solid", fgColor=RED_BG), font=Font(bold=True, color=RED_TXT))
+        )
 
     # --- column widths, freeze header, autofilter ---
     for i, width in enumerate(REPORT_COL_WIDTHS, start=1):
