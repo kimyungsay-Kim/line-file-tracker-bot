@@ -335,7 +335,7 @@ INSPECTION_FILES_URL = os.environ.get(
     "https://firsttechno.storage-readyidc.com/index.php/s/WpypEPtTLXxMkt5",
 )
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมินส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ"):
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ"):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
     given group. Uses a raw HTTP call instead of the messaging SDK's typed
