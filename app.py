@@ -909,7 +909,7 @@ def normalize_doc_code(raw):
 def doc_reply_liff_url(code):
     if not LIFF_ID:
         return None
-    return f"https://liff.line.me/{LIFF_ID}?code={requests.utils.quote(code)}"
+    return f"https://liff.line.me/{LIFF_ID}?doc={requests.utils.quote(code)}"
 
 def save_inspection_docs(items, group_id):
     now_iso = bkk_now().isoformat()
@@ -1207,7 +1207,7 @@ function renderDocList(data){
   const list = $("list"); list.innerHTML = "";
   if(!data.docs.length){ list.append(el("div","empty","ยังไม่มีเอกสารที่โพสต์ล่าสุด")); return; }
   data.docs.forEach(d=>{
-    const a = el("a","doc"); a.href = "?code="+encodeURIComponent(d.code);
+    const a = el("a","doc"); a.href = "?doc="+encodeURIComponent(d.code);
     a.append(el("span","count"+(d.replies?"":" zero"), d.replies? d.replies+" คำตอบ":"ยังไม่มีคำตอบ"), el("span","code",d.code), el("div","subject",d.subject), el("div","meta","ส่งเข้าระบบ "+d.date));
     list.append(a);
   });
@@ -1226,7 +1226,7 @@ async function send(){
     await liff.init({liffId: LIFF_ID});
     if(!liff.isLoggedIn()){ liff.login({redirectUri: location.href}); return; }
     token = liff.getIDToken();
-    code = new URLSearchParams(location.search).get("code");
+    code = new URLSearchParams(location.search).get("doc");
     if(code){ renderThread(await api("/api/docs/"+encodeURIComponent(code)+"/replies")); }
     else { renderDocList(await api("/api/docs")); }
     $("send").onclick = send;
