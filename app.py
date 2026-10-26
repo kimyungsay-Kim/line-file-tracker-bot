@@ -328,6 +328,13 @@ def reply_text_flex_text(reply_token, lead_alt_text, lead_contents, alt_text, co
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
+# Shared folder holding the inspection document files, linked under the
+# @All mention. Override with INSPECTION_FILES_URL without a code change.
+INSPECTION_FILES_URL = os.environ.get(
+    "INSPECTION_FILES_URL",
+    "https://firsttechno.storage-readyidc.com/index.php/s/WpypEPtTLXxMkt5",
+)
+
 def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมินค่ะ"):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
@@ -340,7 +347,9 @@ def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_t
         {"type": "flex", "altText": flex_alt_text, "contents": flex_contents},
         {
             "type": "textV2",
-            "text": f"{{user1}} {mention_text}",
+            "text": f"{{user1}} {mention_text}"
+                    + (f"\nรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ\n{INSPECTION_FILES_URL}"
+                       if INSPECTION_FILES_URL else ""),
             "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}},
         },
     ]
