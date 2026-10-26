@@ -296,7 +296,7 @@ def reply_text_flex_text(reply_token, lead_alt_text, lead_contents, alt_text, co
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบครับ"):
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบค่ะ"):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
     given group. Uses a raw HTTP call instead of the messaging SDK's typed
@@ -563,7 +563,7 @@ def build_inspection_announce_flex(n):
                     {"type": "span", "text": "📋✨ แจ้งข้อมูลเอกสาร Request จาก บมจ.พรีบิลท์ (PB) "},
                     {"type": "span", "text": f"จำนวน {n} ฉบับ",
                      "color": INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR, "weight": "bold"},
-                    {"type": "span", "text": " ดังนี้ครับ 📑"},
+                    {"type": "span", "text": " ดังนี้ค่ะ 📑"},
                 ]
             }]
         }
