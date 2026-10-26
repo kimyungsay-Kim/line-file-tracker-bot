@@ -487,15 +487,26 @@ def handle_text(event):
         reply(event.reply_token, f"group_id ของกลุ่มนี้คือ:\n{group_id}")
         return
 
-    # set THIS group as where the inspection document list gets posted
+    # set THIS group as where the inspection document list gets posted.
+    # Owner-only, and the bot never replies in the group: the result goes to
+    # the owner's 1:1 chat, so after unsending their own command message the
+    # group shows no trace of it. Anyone else typing it is silently ignored.
     if text in ("ตั้งกลุ่มแจ้งเอกสาร", "ตั้งกลุ่มนี้แจ้งเอกสาร"):
+        sender_id = source.user_id
+        allowed = {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
+        if sender_id not in allowed:
+            return
         try:
             set_setting("inspection_target_group_id", group_id)
-            reply(event.reply_token,
-                  f"ตั้งกลุ่ม \"{get_group_name(group_id)}\" เป็นกลุ่มปลายทางสำหรับแจ้งเอกสาร Request แล้วค่ะ ✅")
+            push_to(sender_id,
+                    f"ตั้งกลุ่ม \"{get_group_name(group_id)}\" เป็นกลุ่มปลายทางสำหรับแจ้งเอกสาร Request แล้วค่ะ ✅\n"
+                    "กดยกเลิกข้อความคำสั่งในกลุ่มได้เลย")
         except Exception:
             app.logger.exception("set inspection target group failed")
-            reply(event.reply_token, "ตั้งค่ากลุ่มไม่สำเร็จค่ะ ลองใหม่อีกครั้ง")
+            try:
+                push_to(sender_id, "ตั้งค่ากลุ่มไม่สำเร็จค่ะ ลองใหม่อีกครั้ง")
+            except Exception:
+                app.logger.exception("could not notify owner")
         return
 
     if not TAGGED_USER_IDS:
