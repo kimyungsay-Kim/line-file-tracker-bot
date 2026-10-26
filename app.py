@@ -61,6 +61,15 @@ REPORT_ACCESS_KEY = os.environ.get("REPORT_ACCESS_KEY", "")
 # command works either way since it can read the host from its own request.
 SERVICE_BASE_URL = os.environ.get("SERVICE_BASE_URL", "").rstrip("/")
 
+# Document replies (team types answers into a posted inspection document).
+# LIFF_ID: the LIFF app's ID (from LINE Developers > LINE Login channel > LIFF),
+#   endpoint URL set to <SERVICE_BASE_URL>/liff/reply. Without it the cards get
+#   no "ตอบกลับ" button, but the in-group shortcut "AR-337 <ข้อความ>" still works.
+# LINE_LOGIN_CHANNEL_ID: that LINE Login channel's Channel ID, used to verify
+#   the ID token the LIFF page sends, so a reply is always tied to a real LINE user.
+LIFF_ID = os.environ.get("LIFF_ID", "").strip()
+LINE_LOGIN_CHANNEL_ID = os.environ.get("LINE_LOGIN_CHANNEL_ID", "").strip()
+
 # Turso (hosted libSQL/SQLite) - persistent storage, survives redeploys unlike a local
 # sqlite file on Render's free tier (which has no disk and resets on every deploy).
 TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
@@ -141,6 +150,31 @@ SCHEMA_STATEMENTS = [
         user_id TEXT,
         ids_json TEXT,
         description TEXT,
+        created_at TEXT
+    )
+    """,
+    # every inspection document that has been posted to a group, keyed by its
+    # short code (e.g. "AR-337"), so the team can reply to it afterwards
+    """
+    CREATE TABLE IF NOT EXISTS inspection_docs (
+        code TEXT PRIMARY KEY,
+        doc_number TEXT,
+        subject TEXT,
+        date TEXT,
+        extra_note TEXT,
+        group_id TEXT,
+        posted_at TEXT
+    )
+    """,
+    # replies typed by the team about a posted document - many per document
+    """
+    CREATE TABLE IF NOT EXISTS doc_replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT,
+        user_id TEXT,
+        user_name TEXT,
+        text TEXT,
+        source TEXT,          -- 'group' (typed "AR-337 ...") or 'liff'
         created_at TEXT
     )
     """,
@@ -315,15 +349,17 @@ def reply_flex_and_text(reply_token, alt_text, contents_dict, text):
         ))
 
 def reply_text_flex_text(reply_token, lead_alt_text, lead_contents, alt_text, contents_dict, trailing_text):
+    """contents_dict may be one bubble or a list of bubbles (sent one per message)."""
+    bubbles = contents_dict if isinstance(contents_dict, list) else [contents_dict]
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.reply_message(ReplyMessageRequest(
             reply_token=reply_token,
-            messages=[
-                FlexMessage(alt_text=lead_alt_text, contents=FlexContainer.from_dict(lead_contents)),
-                FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict)),
-                TextMessage(text=trailing_text),
-            ]
+            messages=(
+                [FlexMessage(alt_text=lead_alt_text, contents=FlexContainer.from_dict(lead_contents))]
+                + [FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(b)) for b in bubbles]
+                + [TextMessage(text=trailing_text)]
+            )
         ))
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -342,9 +378,10 @@ def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_t
     message classes because the installed line-bot-sdk version here doesn't
     expose LINE's textV2/mention payload - this builds that payload
     directly, per LINE's documented format."""
+    bubbles = flex_contents if isinstance(flex_contents, list) else [flex_contents]
     messages = [
         {"type": "flex", "altText": lead_alt_text, "contents": lead_contents},
-        {"type": "flex", "altText": flex_alt_text, "contents": flex_contents},
+        *[{"type": "flex", "altText": flex_alt_text, "contents": b} for b in bubbles],
         {
             "type": "textV2",
             "text": f"{{user1}} {mention_text}"
@@ -477,6 +514,14 @@ def handle_text(event):
             reply(event.reply_token, handle_close_command(text[len("โหลดแล้ว "):], source.user_id))
         elif text.startswith("✅") or text.startswith("👍"):
             reply(event.reply_token, handle_close_command(text[1:], source.user_id))
+        elif text in ("คำตอบ", "ตอบกลับ", "replies"):
+            alt_text, contents = build_replies_overview_flex()
+            if contents is None:
+                reply(event.reply_token, alt_text)
+            else:
+                reply_flex(event.reply_token, alt_text, contents)
+        elif text.startswith("คำตอบ "):
+            reply(event.reply_token, build_reply_thread_text(text[len("คำตอบ "):]))
         elif text in ("ย้อนกลับ", "เลิกทำ", "undo"):
             reply(event.reply_token, undo_last_close(source.user_id))
         elif text in ("รายงาน", "report", "export"):
@@ -517,6 +562,14 @@ def handle_text(event):
             except Exception:
                 app.logger.exception("could not notify owner")
         return
+
+    # shortcut reply: "AR-337 ตรวจแล้ว เหลือแก้รอยต่อฝ้า" saves a reply to
+    # that posted document silently (no message back, to save LINE quota).
+    # Doesn't return - a reply that also tags someone is still tracked below.
+    try:
+        record_group_reply_shortcut(group_id, source.user_id, text)
+    except Exception:
+        app.logger.exception("group reply shortcut failed")
 
     if not TAGGED_USER_IDS:
         return
@@ -677,6 +730,9 @@ INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนก�
 INSPECTION_SEPARATOR_COLOR = "#0D47A1"   # divider line between documents - dark blue
 
 INSPECTION_MAX_ITEMS = 30  # safety cap so the flex message doesn't blow past LINE's size limit
+INSPECTION_BUBBLE_MAX_BYTES = 28000  # LINE's per-bubble cap is 30 KB; keep some headroom
+# a push/reply carries at most 5 messages: lead + document bubbles + closing message
+INSPECTION_MAX_BUBBLES = 3
 
 def build_inspection_carousel_flex(items):
     """A SINGLE bubble listing every document stacked vertically, one block
@@ -710,10 +766,9 @@ def build_inspection_carousel_flex(items):
         }
 
     shown = items[:INSPECTION_MAX_ITEMS]
-    body = []
-    for i, it in enumerate(shown):
-        if i > 0:
-            body.append({"type": "separator", "margin": "xl", "color": INSPECTION_SEPARATOR_COLOR})
+    doc_blocks = []
+    for it in shown:
+        body = []
         body.append(doc_number_badge(it["code"]))
         body.append(field("🔖", "Code", it["doc_number"], INSPECTION_VALUE_COLOR))
         body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_VALUE_COLOR))
@@ -721,18 +776,55 @@ def build_inspection_carousel_flex(items):
         if it.get("extra_note"):
             body.append(field("🧱", "วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ", it["extra_note"],
                                INSPECTION_EXTRA_NOTE_COLOR))
+        reply_link = doc_reply_liff_url(it["code"])
+        if reply_link:
+            body.append({
+                "type": "text", "text": "💬 ตอบกลับเอกสารนี้", "size": "xs", "weight": "bold",
+                "color": REPLY_LINK_COLOR, "margin": "md", "decoration": "underline",
+                "action": {"type": "uri", "label": "ตอบกลับ", "uri": reply_link},
+            })
+        doc_blocks.append(body)
 
     if len(items) > INSPECTION_MAX_ITEMS:
-        body.append({"type": "separator", "margin": "xl"})
-        body.append(txt(f"… มีอีก {len(items) - INSPECTION_MAX_ITEMS} รายการที่ไม่ได้แสดง",
-                         size="xs", color=INSPECTION_LABEL_COLOR, margin="md"))
+        doc_blocks[-1] = doc_blocks[-1] + [
+            {"type": "separator", "margin": "xl"},
+            txt(f"… มีอีก {len(items) - INSPECTION_MAX_ITEMS} รายการที่ไม่ได้แสดง",
+                size="xs", color=INSPECTION_LABEL_COLOR, margin="md"),
+        ]
 
-    contents = {
-        "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body, "paddingAll": "lg"},
-    }
+    # LINE rejects a bubble whose JSON is over 30 KB (Thai text is 3 bytes a
+    # character, so ~16 documents already reach that). Pack documents into as
+    # few bubbles as fit; they're sent as separate messages one under another,
+    # so the list still reads top-to-bottom without sideways swiping.
+    def bubble(blocks):
+        body = []
+        for i, b in enumerate(blocks):
+            if i > 0:
+                body.append({"type": "separator", "margin": "xl", "color": INSPECTION_SEPARATOR_COLOR})
+            body.extend(b)
+        return {"type": "bubble",
+                "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body, "paddingAll": "lg"}}
+
+    def size_of(b):
+        return len(json.dumps(b, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    bubbles, current = [], []
+    for block in doc_blocks:
+        if current and size_of(bubble(current + [block])) > INSPECTION_BUBBLE_MAX_BYTES:
+            bubbles.append(bubble(current))
+            current = []
+        current.append(block)
+    if current:
+        bubbles.append(bubble(current))
+    if len(bubbles) > INSPECTION_MAX_BUBBLES:
+        app.logger.warning("inspection list needs %d bubbles, only %d sent", len(bubbles), INSPECTION_MAX_BUBBLES)
+        bubbles = bubbles[:INSPECTION_MAX_BUBBLES]
+        bubbles[-1]["body"]["contents"].append(
+            txt("… รายการยาวเกินกว่าที่ LINE ส่งได้ในครั้งเดียว กรุณาแบ่งส่งเป็นสองรอบ",
+                size="xs", color=OVERDUE_COLOR, margin="md"))
+
     alt_text = f"เอกสารตรวจสอบ {len(items)} รายการ"
-    return alt_text, contents
+    return alt_text, bubbles
 
 def handle_inspection_confirm(user_id):
     items = get_inspection_preview(user_id)
@@ -755,6 +847,10 @@ def handle_inspection_confirm(user_id):
         return ("โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือพิมพ์ \"ตั้งกลุ่มแจ้งเอกสาร\" "
                 "ในกลุ่มที่ต้องการก่อน" + detail)
     clear_inspection_preview(user_id)
+    try:
+        save_inspection_docs(items, target)
+    except Exception:
+        app.logger.exception("could not record posted inspection docs for replies")
     try:
         set_setting("last_inspection_post_group_id", target)
     except Exception:
@@ -788,6 +884,364 @@ def handle_wrong_group_notice():
         detail = f"\n(LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})" if resp is not None else ""
         return "ส่งข้อความแจ้งขออภัยไม่สำเร็จครับ" + detail
     return f'ส่งข้อความแจ้งขออภัยเข้ากลุ่ม "{get_group_name(target)}" แล้วครับ'
+
+# ---------- Document replies (team answers to posted inspection docs) ----------
+# Each posted document gets a reply thread. Team members add to it either by
+# typing "<code> <message>" in the group (e.g. "AR-337 ตรวจแล้ว") or through
+# the LIFF page opened from the card's "💬 ตอบกลับเอกสารนี้" link. Nothing is
+# pushed when a reply arrives; the owner checks with the 1:1 "คำตอบ" command.
+import re
+
+REPLY_LINK_COLOR = "#1565C0"
+REPLY_MAX_LEN = 1000
+REPLIES_OVERVIEW_DAYS = int(os.environ.get("REPLIES_OVERVIEW_DAYS", "14"))
+REPLIES_OVERVIEW_MAX_DOCS = 40
+
+# "AR-337 ข้อความ", "st-802: ข้อความ", "AR 337 - ข้อความ" (code at the very start)
+REPLY_SHORTCUT_RE = re.compile(r"^\s*([A-Za-z]{1,5})\s*-?\s*(\d{1,5})\s*[:：\-–]?\s+(.+)$", re.DOTALL)
+
+def normalize_doc_code(raw):
+    m = re.match(r"^\s*([A-Za-z]{1,5})\s*-?\s*(\d{1,5})\s*$", raw or "")
+    if not m:
+        return None
+    return f"{m.group(1).upper()}-{int(m.group(2))}"
+
+def doc_reply_liff_url(code):
+    if not LIFF_ID:
+        return None
+    return f"https://liff.line.me/{LIFF_ID}?code={requests.utils.quote(code)}"
+
+def save_inspection_docs(items, group_id):
+    now_iso = bkk_now().isoformat()
+    conn = db()
+    try:
+        rows = []
+        for it in items:
+            code = normalize_doc_code(it["code"]) or it["code"].strip().upper()
+            rows.append((code, it["doc_number"], it["subject"], it["date"],
+                         it.get("extra_note", ""), group_id, now_iso))
+        conn.executemany(
+            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
+            "doc_number = excluded.doc_number, subject = excluded.subject, date = excluded.date, "
+            "extra_note = excluded.extra_note, group_id = excluded.group_id, posted_at = excluded.posted_at",
+            rows,
+        )
+    finally:
+        conn.close()
+
+def get_inspection_doc(code):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT code, doc_number, subject, date, extra_note, posted_at FROM inspection_docs WHERE code = ?",
+            (code,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return dict(zip(("code", "doc_number", "subject", "date", "extra_note", "posted_at"), row))
+
+def add_doc_reply(code, user_id, user_name, text, source):
+    text = (text or "").strip()
+    if not text:
+        return False
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO doc_replies (code, user_id, user_name, text, source, created_at) VALUES (?,?,?,?,?,?)",
+            (code, user_id, user_name, text[:REPLY_MAX_LEN], source, bkk_now().isoformat()),
+        )
+    finally:
+        conn.close()
+    return True
+
+def get_doc_replies(code):
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT user_name, text, source, created_at, user_id FROM doc_replies WHERE code = ? ORDER BY created_at, id",
+            (code,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(zip(("user_name", "text", "source", "created_at", "user_id"), r)) for r in rows]
+
+def record_group_reply_shortcut(group_id, user_id, text):
+    """Returns True when the text was saved as a reply. Only codes that were
+    actually posted count, so ordinary chat that happens to start with
+    something like "EE-1 ..." isn't swallowed by mistake."""
+    m = REPLY_SHORTCUT_RE.match(text or "")
+    if not m:
+        return False
+    code = f"{m.group(1).upper()}-{int(m.group(2))}"
+    if not get_inspection_doc(code):
+        return False
+    name = get_profile_name(group_id, user_id) if user_id else "ไม่ทราบชื่อ"
+    return add_doc_reply(code, user_id, name, m.group(3), "group")
+
+def _fmt_dt(iso):
+    try:
+        return datetime.datetime.fromisoformat(iso).strftime("%d/%m %H:%M")
+    except (ValueError, TypeError):
+        return ""
+
+def build_replies_overview_flex():
+    """1:1 "คำตอบ": recently posted documents with how many replies each has,
+    the latest reply, and the ones nobody has answered yet listed first."""
+    since = (bkk_now() - datetime.timedelta(days=REPLIES_OVERVIEW_DAYS)).isoformat()
+    conn = db()
+    try:
+        docs = conn.execute(
+            "SELECT d.code, d.subject, d.posted_at, "
+            "  (SELECT COUNT(*) FROM doc_replies r WHERE r.code = d.code), "
+            "  (SELECT r.user_name || ': ' || r.text FROM doc_replies r WHERE r.code = d.code "
+            "     ORDER BY r.created_at DESC, r.id DESC LIMIT 1) "
+            "FROM inspection_docs d WHERE d.posted_at >= ? ORDER BY d.posted_at DESC, d.code",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not docs:
+        return (f"ยังไม่มีเอกสารที่โพสต์เข้ากลุ่มในช่วง {REPLIES_OVERVIEW_DAYS} วันที่ผ่านมาครับ", None)
+
+    unanswered = [d for d in docs if not d[3]]
+    answered = [d for d in docs if d[3]]
+    txt = flex_txt
+    body = [txt("💬 คำตอบเอกสาร", weight="bold", size="lg", color="#111111"),
+            txt(f"{REPLIES_OVERVIEW_DAYS} วันล่าสุด · ทั้งหมด {len(docs)} ฉบับ · "
+                f"ยังไม่มีคำตอบ {len(unanswered)} ฉบับ",
+                size="xs", color="#888888", margin="xs"),
+            {"type": "separator", "margin": "md"}]
+
+    shown = 0
+    def doc_block(code, subject, n, latest, color):
+        block = [two_tone_text(code, color, f"  ({n} คำตอบ)" if n else "  (ยังไม่มีคำตอบ)",
+                               size="sm", margin="md")]
+        block.append(txt(subject, size="xs", color="#444444", margin="none"))
+        if latest:
+            preview = latest.replace("\n", " ")
+            block.append(txt(f"↳ {preview[:120]}{'…' if len(preview) > 120 else ''}",
+                             size="xs", color="#0B6E4F", margin="none"))
+        return block
+
+    if unanswered:
+        body.append(txt("🔴 ยังไม่มีคำตอบ", weight="bold", size="sm", color=OVERDUE_COLOR, margin="md"))
+        for code, subject, _, n, latest in unanswered:
+            if shown >= REPLIES_OVERVIEW_MAX_DOCS:
+                break
+            body.extend(doc_block(code, subject, n, latest, OVERDUE_COLOR))
+            shown += 1
+    if answered and shown < REPLIES_OVERVIEW_MAX_DOCS:
+        body.append({"type": "separator", "margin": "lg"})
+        body.append(txt("✅ มีคำตอบแล้ว", weight="bold", size="sm", color="#0B6E4F", margin="md"))
+        for code, subject, _, n, latest in answered:
+            if shown >= REPLIES_OVERVIEW_MAX_DOCS:
+                break
+            body.extend(doc_block(code, subject, n, latest, "#0D47A1"))
+            shown += 1
+    if shown < len(docs):
+        body.append(txt(f"… มีอีก {len(docs) - shown} ฉบับที่ไม่ได้แสดง", size="xs", color="#999999", margin="md"))
+
+    body.append({"type": "separator", "margin": "lg"})
+    body.append(txt('ดูคำตอบทั้งหมดของเอกสาร: พิมพ์ "คำตอบ AR-337"', size="xs", color="#888888", margin="md"))
+    contents = {"type": "bubble",
+                "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body}}
+    return (f"คำตอบเอกสาร: ยังไม่มีคำตอบ {len(unanswered)} จาก {len(docs)} ฉบับ", contents)
+
+def build_reply_thread_text(raw_code):
+    code = normalize_doc_code(raw_code)
+    if not code:
+        return 'พิมพ์รหัสเอกสารให้ถูกรูปแบบครับ เช่น "คำตอบ AR-337"'
+    doc = get_inspection_doc(code)
+    if not doc:
+        return f"ไม่พบเอกสาร {code} ในรายการที่เคยโพสต์เข้ากลุ่มครับ"
+    replies = get_doc_replies(code)
+    lines = [f"📌 {code} · {doc['subject']}", f"ส่งเข้าระบบ {doc['date']}", ""]
+    if not replies:
+        lines.append("ยังไม่มีคำตอบครับ")
+    for r in replies:
+        lines.append(f"👤 {r['user_name']} ({_fmt_dt(r['created_at'])} น.)")
+        lines.append("   " + r["text"].replace("\n", "\n   "))
+    text = "\n".join(lines)
+    return text if len(text) <= 4900 else text[:4900] + "\n…(ยาวเกิน แสดงไม่ครบ)"
+
+def count_unanswered_docs():
+    since = (bkk_now() - datetime.timedelta(days=REPLIES_OVERVIEW_DAYS)).isoformat()
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM inspection_docs d WHERE d.posted_at >= ? AND NOT EXISTS "
+            "(SELECT 1 FROM doc_replies r WHERE r.code = d.code)",
+            (since,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else 0
+
+# --- LIFF page + JSON API ---
+LINE_VERIFY_ID_TOKEN_URL = "https://api.line.me/oauth2/v2.1/verify"
+
+def verify_liff_id_token(id_token):
+    """Returns (user_id, display_name) for a valid LINE ID token, else (None, None)."""
+    if not id_token or not LINE_LOGIN_CHANNEL_ID:
+        return (None, None)
+    try:
+        resp = requests.post(LINE_VERIFY_ID_TOKEN_URL,
+                             data={"id_token": id_token, "client_id": LINE_LOGIN_CHANNEL_ID},
+                             timeout=10)
+        if resp.status_code != 200:
+            app.logger.warning("ID token verify failed: %s %s", resp.status_code, resp.text[:200])
+            return (None, None)
+        data = resp.json()
+        return (data.get("sub"), data.get("name") or "ไม่ทราบชื่อ")
+    except Exception:
+        app.logger.exception("ID token verify error")
+        return (None, None)
+
+def _liff_auth():
+    auth = request.headers.get("Authorization", "")
+    token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+    return verify_liff_id_token(token)
+
+@app.route("/api/docs/<code>/replies", methods=["GET", "POST"])
+def api_doc_replies(code):
+    user_id, user_name = _liff_auth()
+    if not user_id:
+        return {"error": "unauthorized"}, 401
+    code = normalize_doc_code(code)
+    doc = get_inspection_doc(code) if code else None
+    if not doc:
+        return {"error": "not_found"}, 404
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        text = (payload.get("text") or "").strip()
+        if not text:
+            return {"error": "empty"}, 400
+        add_doc_reply(code, user_id, user_name, text, "liff")
+    replies = [{"user_name": r["user_name"], "text": r["text"],
+                "time": _fmt_dt(r["created_at"]), "mine": r["user_id"] == user_id}
+               for r in get_doc_replies(code)]
+    return {"doc": doc, "replies": replies}
+
+@app.route("/api/docs", methods=["GET"])
+def api_docs():
+    user_id, _ = _liff_auth()
+    if not user_id:
+        return {"error": "unauthorized"}, 401
+    since = (bkk_now() - datetime.timedelta(days=REPLIES_OVERVIEW_DAYS)).isoformat()
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT d.code, d.subject, d.date, (SELECT COUNT(*) FROM doc_replies r WHERE r.code = d.code) "
+            "FROM inspection_docs d WHERE d.posted_at >= ? ORDER BY d.posted_at DESC, d.code",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"docs": [{"code": c, "subject": s, "date": dt, "replies": n} for c, s, dt, n in rows]}
+
+LIFF_REPLY_HTML = r"""<!doctype html>
+<html lang="th"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ตอบกลับเอกสาร</title>
+<style>
+  :root{--blue:#0D47A1;--pill:#E3F2FD;--grey:#78909C;--line:#E0E0E0;--green:#0B6E4F;--bg:#F5F7FA}
+  *{box-sizing:border-box} body{margin:0;font-family:-apple-system,"Sukhumvit Set","Noto Sans Thai",sans-serif;background:var(--bg);color:#111}
+  header{background:#fff;padding:14px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+  .code{display:inline-block;background:var(--pill);color:var(--blue);font-weight:700;padding:3px 10px;border-radius:8px;font-size:14px}
+  .subject{margin:8px 0 2px;font-weight:600;font-size:15px;line-height:1.4}
+  .meta{color:var(--grey);font-size:12px}
+  main{padding:12px 16px 110px}
+  .reply{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px}
+  .reply.mine{border-color:#90CAF9}
+  .who{font-size:12px;color:var(--green);font-weight:700}.who span{color:var(--grey);font-weight:400;margin-left:6px}
+  .text{margin-top:4px;white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.5}
+  .empty,.msg{color:var(--grey);text-align:center;padding:28px 0;font-size:14px}
+  footer{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);padding:10px 12px;display:flex;gap:8px}
+  textarea{flex:1;border:1px solid #CFD8DC;border-radius:10px;padding:10px;font:inherit;font-size:14px;resize:none;height:44px;max-height:120px}
+  button{background:var(--blue);color:#fff;border:0;border-radius:10px;padding:0 18px;font-weight:700;font-size:14px}
+  button:disabled{opacity:.5}
+  .doc{display:block;background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px;color:inherit;text-decoration:none}
+  .count{float:right;font-size:12px;color:var(--grey)} .count.zero{color:#C62828;font-weight:700}
+</style></head>
+<body>
+<header id="head"><div class="meta">กำลังโหลด…</div></header>
+<main id="list"></main>
+<footer id="composer" style="display:none">
+  <textarea id="input" placeholder="พิมพ์คำตอบ…" maxlength="1000"></textarea>
+  <button id="send">ส่ง</button>
+</footer>
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<script>
+const LIFF_ID = "__LIFF_ID__";
+const $ = id => document.getElementById(id);
+function el(tag, cls, text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+let token = null, code = null;
+
+async function api(path, opts={}){
+  const r = await fetch(path, Object.assign({headers:{"Authorization":"Bearer "+token,"Content-Type":"application/json"}}, opts));
+  if(!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+function renderThread(data){
+  const d = data.doc, head = $("head"); head.innerHTML = "";
+  head.append(el("span","code",d.code), el("div","subject",d.subject), el("div","meta","ส่งเข้าระบบ "+d.date+(d.extra_note?" · ดำเนินงาน "+d.extra_note:"")));
+  const list = $("list"); list.innerHTML = "";
+  if(!data.replies.length){ list.append(el("div","empty","ยังไม่มีคำตอบ เป็นคนแรกที่ตอบได้เลย")); }
+  data.replies.forEach(r=>{
+    const box = el("div","reply"+(r.mine?" mine":""));
+    const who = el("div","who",r.user_name); who.append(el("span",null,r.time+" น."));
+    box.append(who, el("div","text",r.text)); list.append(box);
+  });
+  $("composer").style.display = "flex";
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+function renderDocList(data){
+  const head = $("head"); head.innerHTML = "";
+  head.append(el("div","subject","💬 เลือกเอกสารที่จะตอบกลับ"));
+  const list = $("list"); list.innerHTML = "";
+  if(!data.docs.length){ list.append(el("div","empty","ยังไม่มีเอกสารที่โพสต์ล่าสุด")); return; }
+  data.docs.forEach(d=>{
+    const a = el("a","doc"); a.href = "?code="+encodeURIComponent(d.code);
+    a.append(el("span","count"+(d.replies?"":" zero"), d.replies? d.replies+" คำตอบ":"ยังไม่มีคำตอบ"), el("span","code",d.code), el("div","subject",d.subject), el("div","meta","ส่งเข้าระบบ "+d.date));
+    list.append(a);
+  });
+}
+
+async function send(){
+  const input = $("input"), text = input.value.trim(); if(!text) return;
+  const btn = $("send"); btn.disabled = true;
+  try{ renderThread(await api("/api/docs/"+encodeURIComponent(code)+"/replies",{method:"POST",body:JSON.stringify({text})})); input.value=""; }
+  catch(e){ alert("ส่งไม่สำเร็จ ลองใหม่อีกครั้ง"); }
+  btn.disabled = false;
+}
+
+(async function(){
+  try{
+    await liff.init({liffId: LIFF_ID});
+    if(!liff.isLoggedIn()){ liff.login({redirectUri: location.href}); return; }
+    token = liff.getIDToken();
+    code = new URLSearchParams(location.search).get("code");
+    if(code){ renderThread(await api("/api/docs/"+encodeURIComponent(code)+"/replies")); }
+    else { renderDocList(await api("/api/docs")); }
+    $("send").onclick = send;
+  }catch(e){
+    $("head").innerHTML = ""; $("head").append(el("div","msg", e.message==="404" ? "ไม่พบเอกสารนี้ในรายการที่โพสต์" : "โหลดไม่สำเร็จ ลองปิดแล้วเปิดใหม่ ("+e.message+")"));
+  }
+})();
+</script>
+</body></html>"""
+
+@app.route("/liff/reply", methods=["GET"])
+def liff_reply_page():
+    if not LIFF_ID:
+        return Response("LIFF_ID is not configured on the server.", status=503, mimetype="text/plain")
+    return Response(LIFF_REPLY_HTML.replace("__LIFF_ID__", LIFF_ID), mimetype="text/html")
 
 # ---------- Summary building ----------
 def build_summary_text(date=None):
@@ -1642,10 +2096,22 @@ def send_daily_digest():
         else:
             push_flex_to(uid, alt_text, contents)
 
+    # folded into the same report message (no extra push) to save LINE quota
+    try:
+        unanswered = count_unanswered_docs()
+    except Exception:
+        app.logger.exception("could not count unanswered docs")
+        unanswered = 0
+    reply_note = (f'\n\n💬 เอกสารที่ยังไม่มีคำตอบ {unanswered} ฉบับ — พิมพ์ "คำตอบ" เพื่อดู'
+                  if unanswered else "")
+
     report_url = daily_report_url()
     if report_url:
         for uid in recipients:
-            push_to(uid, f"📄 รายงานข้อมูลวันนี้ (ไฟล์ Excel จัดสีสวยพร้อมเปิด):\n{report_url}")
+            push_to(uid, f"📄 รายงานข้อมูลวันนี้ (ไฟล์ Excel จัดสีสวยพร้อมเปิด):\n{report_url}{reply_note}")
+    elif reply_note:
+        for uid in recipients:
+            push_to(uid, reply_note.strip())
 
 # ---------- Overdue (leftover from previous days) morning digest ----------
 OVERDUE_COLOR = "#C62828"  # red
