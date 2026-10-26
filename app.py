@@ -328,7 +328,7 @@ def reply_text_flex_text(reply_token, lead_alt_text, lead_contents, alt_text, co
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบค่ะ"):
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมินค่ะ"):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
     given group. Uses a raw HTTP call instead of the messaging SDK's typed
