@@ -3,6 +3,7 @@ import io
 import csv
 import json
 import datetime
+import unicodedata
 from zoneinfo import ZoneInfo
 
 import libsql_client
@@ -121,6 +122,17 @@ SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS pending_inspection_previews (
         user_id TEXT PRIMARY KEY,
         items_json TEXT,
+        created_at TEXT
+    )
+    """,
+    # one row per close action ("โหลดแล้ว" / "✅ ..."), so "ย้อนกลับ" can
+    # reopen exactly the items that action closed
+    """
+    CREATE TABLE IF NOT EXISTS close_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        ids_json TEXT,
+        description TEXT,
         created_at TEXT
     )
     """,
@@ -413,15 +425,13 @@ def handle_text(event):
         elif text in ("id", "whoami", "ไอดี"):
             reply(event.reply_token, f"user_id ของคุณคือ:\n{source.user_id}")
         elif text in ("โหลดแล้ว", "✅", "👍"):
-            reply(event.reply_token, mark_downloaded(marked_by_name=get_profile_name(None, source.user_id)))
+            reply(event.reply_token, handle_close_command("", source.user_id))
         elif text.startswith("โหลดแล้ว "):
-            reply(event.reply_token, mark_downloaded(
-                text[len("โหลดแล้ว "):].strip(), marked_by_name=get_profile_name(None, source.user_id)
-            ))
-        elif text.startswith("✅ ") or text.startswith("👍 "):
-            reply(event.reply_token, mark_downloaded(
-                text[2:].strip(), marked_by_name=get_profile_name(None, source.user_id)
-            ))
+            reply(event.reply_token, handle_close_command(text[len("โหลดแล้ว "):], source.user_id))
+        elif text.startswith("✅") or text.startswith("👍"):
+            reply(event.reply_token, handle_close_command(text[1:], source.user_id))
+        elif text in ("ย้อนกลับ", "เลิกทำ", "undo"):
+            reply(event.reply_token, undo_last_close(source.user_id))
         elif text in ("รายงาน", "report", "export"):
             reply(event.reply_token,
                   f"ดาวน์โหลดรายงานวันนี้ (ไฟล์ Excel จัดสีสวยพร้อมเปิด):\n{daily_report_url()}\n\n"
@@ -722,7 +732,7 @@ def build_summary_text(date=None):
     if pending_total == 0:
         lines.append("\nไฟล์งานโหลดครบแล้วครับ 🎉")
     else:
-        lines.append("\nพิมพ์ \"โหลดแล้ว\" หรือแค่ \"✅\" เพื่อติ๊กว่าโหลดครบหมดแล้ว หรือ \"✅ <ชื่อคน>\" เพื่อติ๊กเฉพาะคนนั้น")
+        lines.append("\n" + CLOSE_HELP_TEXT)
     return "\n".join(lines)
 
 # ---------- Flex building helpers (shared by the daily summary and the overdue digest) ----------
@@ -739,16 +749,46 @@ def flex_txt(content, **kwargs):
 GROUP_NAME_BG_COLOR = "#E8F5E9"    # light green highlight behind the group name
 GROUP_NAME_TEXT_COLOR = "#0B6E4F"  # matches the group header's existing green
 
-def group_name_badge(group_name, margin="lg"):
-    """A highlighted pill behind the group name, so it stands out at a
-    glance when scanning a summary with several groups in it."""
+CLOSE_BUTTON_COLOR = "#0B6E4F"
+
+def close_tap_text(label, command_text):
+    """A small tappable text that sends command_text as if the admin typed it
+    (works in the bot's 1:1 chat, where the summaries are delivered)."""
     return {
-        "type": "box", "layout": "vertical", "margin": margin,
-        "backgroundColor": GROUP_NAME_BG_COLOR, "cornerRadius": "md", "paddingAll": "sm",
-        "contents": [
-            flex_txt(f"📁 {group_name}", weight="bold", size="md", color=GROUP_NAME_TEXT_COLOR)
-        ]
+        "type": "text", "text": label, "size": "xs", "weight": "bold",
+        "color": CLOSE_BUTTON_COLOR, "align": "end", "gravity": "center", "flex": 0,
+        "decoration": "underline",
+        "action": {"type": "message", "label": label[:20], "text": command_text},
     }
+
+def group_name_badge(group_name, margin="lg", with_close_button=False):
+    """A highlighted pill behind the group name, so it stands out at a
+    glance when scanning a summary with several groups in it. With
+    with_close_button, adds a "ปิดทั้งกลุ่ม" tap target that sends "✅ <code>"."""
+    contents = [flex_txt(f"📁 {group_name}", weight="bold", size="md", color=GROUP_NAME_TEXT_COLOR, flex=1)]
+    if with_close_button:
+        contents.append(close_tap_text("✅ ปิดทั้งกลุ่ม", f"✅ {group_close_token(group_name)}"))
+    return {
+        "type": "box", "layout": "horizontal" if with_close_button else "vertical", "margin": margin,
+        "backgroundColor": GROUP_NAME_BG_COLOR, "cornerRadius": "md", "paddingAll": "sm",
+        "spacing": "sm", "contents": contents
+    }
+
+def sender_line(sender_label, group_name, sender_name, with_close_button):
+    """The "👤 name (ค้าง N)" line, plus a "✅ ปิด" tap target for just that
+    person inside that group when they still have pending items."""
+    name_txt = flex_txt(sender_label, weight="bold", size="sm", color="#222222", flex=1)
+    if not with_close_button:
+        name_txt["margin"] = "sm"
+        return name_txt
+    return {
+        "type": "box", "layout": "horizontal", "margin": "sm", "spacing": "sm",
+        "contents": [name_txt, close_tap_text("✅ ปิด", f"✅ {group_close_token(group_name)} {sender_name}")]
+    }
+
+CLOSE_HELP_TEXT = ('กด "✅ ปิดทั้งกลุ่ม" / "✅ ปิด" ด้านบน หรือพิมพ์ "✅" ปิดทั้งหมด, '
+                   '"✅ REQ" / "✅ BIM" / "✅ PM" ปิดทั้งกลุ่ม, "✅ <ชื่อคน>" ปิดเฉพาะคน, '
+                   '"✅ PM <ชื่อคน>" ปิดเฉพาะคนในกลุ่มนั้น — ปิดผิดพิมพ์ "ย้อนกลับ"')
 
 TIME_COLOR = "#888888"  # timestamps, kept visually distinct from the text next to them
 
@@ -871,7 +911,8 @@ def build_summary_flex(date=None, user_id=None):
     truncated = False
 
     for group_name, by_sender in by_group.items():
-        body.append(group_name_badge(group_name))
+        group_has_pending = any(not it[4] for items in by_sender.values() for it in items)
+        body.append(group_name_badge(group_name, with_close_button=group_has_pending))
         for sender_name, items in by_sender.items():
             if item_count >= MAX_ITEMS:
                 truncated = True
@@ -879,8 +920,7 @@ def build_summary_flex(date=None, user_id=None):
             pending_count = sum(1 for e, _, _, _, d, *_ in items if not d)
             pending_total += pending_count
             label = f"  (ค้าง {pending_count})" if pending_count else ""
-            sender_line = f"👤 {sender_name}{label}"
-            body.append(txt(sender_line, weight="bold", size="sm", color="#222222", margin="sm"))
+            body.append(sender_line(f"👤 {sender_name}{label}", group_name, sender_name, pending_count > 0))
 
             for event_type, file_name, text_content, sent_at, downloaded, mention_spans, downloaded_by in items:
                 if item_count >= MAX_ITEMS:
@@ -915,8 +955,7 @@ def build_summary_flex(date=None, user_id=None):
     if pending_total == 0:
         body.append(txt("ปิดสถานะครบทุกรายการแล้วครับ 🎉", size="sm", color="#0B6E4F", margin="md"))
     else:
-        body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อปิดสถานะทั้งหมด หรือ "✅ <ชื่อคน>" เพื่อปิดเฉพาะคนนั้น',
-                         size="xs", color="#888888", margin="md"))
+        body.append(txt(CLOSE_HELP_TEXT, size="xs", color="#888888", margin="md"))
 
     contents = {
         "type": "bubble",
@@ -950,56 +989,211 @@ def _item_label(file_name, text_content):
         snippet = snippet[:40] + "…"
     return snippet or "ข้อความที่ถูกแท็ค"
 
-def mark_downloaded(sender_name=None, marked_by_name=None):
-    # covers BOTH file events and tagged-message (text/pm) events - closing
-    # either kind is the same "โหลดแล้ว"/"✅" action, just worded generically.
-    conn = db()
-    if sender_name:
-        normalized = _normalize_name_for_match(sender_name)
-        pending = conn.execute(
-            "SELECT id, sender_name, file_name, text_content FROM file_events "
-            "WHERE tagged = 1 AND downloaded = 0 "
-            "AND LOWER(TRIM(sender_name)) = ?",
-            (normalized,)
-        ).fetchall()
-    else:
-        pending = conn.execute(
-            "SELECT id, sender_name, file_name, text_content FROM file_events WHERE tagged = 1 AND downloaded = 0"
-        ).fetchall()
+# ---------- Closing by group ----------
+# Short codes for closing a whole group at once ("✅ REQ", "✅ PM Phichet").
+# Each code maps to a fragment of the group's name; a group matches a code when
+# that fragment appears in its name after stripping spaces/punctuation/case.
+# Override or extend with the GROUP_ALIASES env var as JSON, e.g.
+#   {"REQ": "Req't Document", "BIM": "BIM&Shop Dwg", "PM": "Project Management"}
+DEFAULT_GROUP_ALIASES = {
+    "REQ": "Req't Document",
+    "BIM": "BIM&Shop Dwg",
+    "PM": "Project Management",
+}
 
-    if not pending:
-        conn.close()
-        if not sender_name:
-            return "ไม่มีรายการค้างให้ปิดครับ"
-        # name didn't match anyone with a pending item - show the actual
-        # pending names so the user can see the real spelling and retry,
-        # instead of a generic message that reads like "already done".
-        conn2 = db()
-        others = conn2.execute(
-            "SELECT DISTINCT sender_name FROM file_events WHERE tagged = 1 AND downloaded = 0"
-        ).fetchall()
-        conn2.close()
-        if others:
-            names = ", ".join(r[0] for r in others)
-            return (f'ไม่พบชื่อ "{sender_name}" ในรายการที่ยังค้างอยู่ครับ ชื่อที่พิมพ์อาจไม่ตรงกับในระบบเป๊ะๆ '
-                     f'(เช่น มี < > ติดมาด้วย)\nรายชื่อที่ยังมีรายการค้างอยู่ตอนนี้: {names}')
-        return f'ไม่มีรายการค้างให้ปิดครับ (ของ "{sender_name}")'
+def _norm_key(s):
+    """Lowercase and keep only letters/digits/combining marks (Thai vowels
+    included), so "FTC-AIH_Req't Document" and "ftc aih reqt document" compare equal."""
+    return "".join(ch for ch in (s or "").lower() if unicodedata.category(ch)[0] in "LNM")
 
-    ids = [row[0] for row in pending]
-    now_iso = bkk_now().isoformat()
-    conn.executemany(
-        "UPDATE file_events SET downloaded = 1, downloaded_at = ?, downloaded_by = ? WHERE id = ?",
-        [(now_iso, marked_by_name, i) for i in ids]
-    )
-    conn.commit()
-    conn.close()
+def _load_group_aliases():
+    aliases = dict(DEFAULT_GROUP_ALIASES)
+    raw = os.environ.get("GROUP_ALIASES", "").strip()
+    if raw:
+        try:
+            aliases.update({str(k): str(v) for k, v in json.loads(raw).items()})
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return {code.strip().upper(): _norm_key(frag) for code, frag in aliases.items() if _norm_key(frag)}
 
-    target = f"ของ {sender_name} " if sender_name else ""
-    lines = [f"ปิดสถานะ {target}{len(pending)} รายการแล้ว ✅", ""]
-    for _, sname, fname, tcontent in pending:
-        label = _item_label(fname, tcontent)
-        lines.append(f"✅ {label} ({sname})" if not sender_name else f"✅ {label}")
+GROUP_ALIASES = _load_group_aliases()
+
+def group_short_code(group_name):
+    key = _norm_key(group_name)
+    for code, frag in GROUP_ALIASES.items():
+        if frag in key:
+            return code
+    return None
+
+def group_close_token(group_name):
+    """What a button/command uses to point at a group: its short code if it has one."""
+    return group_short_code(group_name) or group_name
+
+def _pending_rows(conn):
+    return conn.execute(
+        "SELECT id, group_name, sender_name, file_name, text_content FROM file_events "
+        "WHERE tagged = 1 AND downloaded = 0 ORDER BY group_name, sender_name, sent_at"
+    ).fetchall()
+
+def _parse_close_target(arg, pending):
+    """Splits the text after "✅"/"โหลดแล้ว" into (group_name, sender_name, error).
+    Order: an exact pending sender name wins (so a person whose name happens to
+    look like part of a group name still works), then the longest leading run of
+    words that names a group (short code, full name or a distinctive part of it),
+    with whatever follows treated as a sender name inside that group."""
+    arg = arg.strip()
+    if not arg:
+        return (None, None, None)
+
+    groups = sorted({r[1] for r in pending if r[1]})
+    senders = {_normalize_name_for_match(r[2]) for r in pending if r[2]}
+    if _normalize_name_for_match(arg) in senders:
+        return (None, arg, None)
+
+    words = arg.split()
+    for k in range(len(words), 0, -1):
+        cand = " ".join(words[:k])
+        rest = " ".join(words[k:]).strip() or None
+        code = _normalize_name_for_match(cand).upper()
+        if code in GROUP_ALIASES:
+            matches = [g for g in groups if GROUP_ALIASES[code] in _norm_key(g)]
+            if not matches:
+                return (None, None, f"กลุ่ม {code} ไม่มีรายการค้างให้ปิดครับ")
+        else:
+            key = _norm_key(cand)
+            if len(key) < 4:
+                continue
+            matches = [g for g in groups if key == _norm_key(g) or key in _norm_key(g)]
+            if not matches:
+                continue
+        if len(matches) > 1:
+            listed = "\n".join(f"• {group_close_token(g)}" for g in matches)
+            return (None, None, f'"{cand}" ตรงกับหลายกลุ่ม ยังไม่ได้ปิดอะไรครับ ระบุให้ชัดขึ้นอีกนิด:\n{listed}')
+        return (matches[0], rest, None)
+
+    return (None, arg, None)
+
+def _remaining_summary(conn):
+    rows = _pending_rows(conn)
+    if not rows:
+        return "ไม่มีรายการค้างแล้วครับ 🎉"
+    counts = {}
+    for _, g, *_ in rows:
+        counts[g] = counts.get(g, 0) + 1
+    parts = [f"{group_close_token(g)} {n}" for g, n in counts.items()]
+    return f"ยังค้างอยู่ {len(rows)} รายการ: " + ", ".join(parts)
+
+def _not_found_message(arg, pending):
+    lines = [f'ไม่พบ "{arg}" ทั้งในชื่อกลุ่มและชื่อคนที่ยังมีรายการค้างครับ ยังไม่ได้ปิดอะไร']
+    groups = sorted({r[1] for r in pending if r[1]})
+    names = sorted({r[2] for r in pending if r[2]})
+    if groups:
+        lines.append("กลุ่มที่ยังค้าง: " + ", ".join(group_close_token(g) for g in groups))
+    if names:
+        lines.append("คนที่ยังค้าง: " + ", ".join(names))
+    lines.append('ตัวอย่าง: "✅ REQ", "✅ Phichet", "✅ PM Phichet"')
     return "\n".join(lines)
+
+def handle_close_command(arg, user_id):
+    """Entry point for "โหลดแล้ว" / "✅" with an optional group and/or person."""
+    arg = arg.replace("\ufe0f", "").strip()  # drop the emoji variation selector some keyboards add
+    marked_by = get_profile_name(None, user_id) if user_id else None
+    conn = db()
+    try:
+        pending = _pending_rows(conn)
+        if not pending:
+            return "ไม่มีรายการค้างให้ปิดครับ"
+
+        group_name, sender_name, error = _parse_close_target(arg, pending)
+        if error:
+            return error
+
+        selected = pending
+        if group_name:
+            selected = [r for r in selected if r[1] == group_name]
+        if sender_name:
+            want = _normalize_name_for_match(sender_name)
+            selected = [r for r in selected if _normalize_name_for_match(r[2] or "") == want]
+
+        if not selected:
+            if group_name and sender_name:
+                in_group = sorted({r[2] for r in pending if r[1] == group_name})
+                return (f'ไม่พบรายการค้างของ "{sender_name}" ในกลุ่ม {group_close_token(group_name)} ครับ\n'
+                        f'คนที่ยังค้างในกลุ่มนี้: {", ".join(in_group)}')
+            return _not_found_message(arg, pending)
+
+        g_token = group_close_token(group_name) if group_name else None
+        if sender_name:
+            sender_name = selected[0][2]  # the real display name, not however it was typed
+        if group_name and sender_name:
+            scope = f"ของ {sender_name} ในกลุ่ม {g_token}"
+        elif group_name:
+            scope = f"ทั้งกลุ่ม {g_token}"
+        elif sender_name:
+            scope = f"ของ {sender_name}"
+        else:
+            scope = "ทั้งหมด"
+
+        # who closed it and how, kept with the item (shows as "ปิดโดย ..." and in the daily report)
+        closed_by = f"{marked_by or 'ไม่ทราบชื่อ'} · ปิด {scope}"
+
+        ids = [r[0] for r in selected]
+        now_iso = bkk_now().isoformat()
+        conn.executemany(
+            "UPDATE file_events SET downloaded = 1, downloaded_at = ?, downloaded_by = ? WHERE id = ? AND downloaded = 0",
+            [(now_iso, closed_by, i) for i in ids]
+        )
+        conn.execute(
+            "INSERT INTO close_batches (user_id, ids_json, description, created_at) VALUES (?,?,?,?)",
+            (user_id, json.dumps(ids), scope, now_iso)
+        )
+
+        lines = [f"ปิดสถานะ {scope} {len(ids)} รายการแล้ว ✅", ""]
+        last_group = None
+        for _, g, sname, fname, tcontent in selected:
+            if not group_name and g != last_group:
+                lines.append(f"📁 {group_close_token(g)}")
+                last_group = g
+            label = _item_label(fname, tcontent)
+            lines.append(f"✅ {label}" if sender_name else f"✅ {label} ({sname})")
+        lines.append("")
+        lines.append(_remaining_summary(conn))
+        lines.append('ปิดผิด? พิมพ์ "ย้อนกลับ" เพื่อเปิดรายการชุดนี้คืน')
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+def mark_downloaded(sender_name=None, marked_by_name=None):
+    """Kept for backward compatibility; closing now goes through handle_close_command."""
+    return handle_close_command(sender_name or "", None)
+
+def undo_last_close(user_id):
+    """Reopens the items closed by this user's most recent close action.
+    Repeating it steps further back, one action at a time."""
+    conn = db()
+    try:
+        batch = conn.execute(
+            "SELECT id, ids_json, description, created_at FROM close_batches WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,)
+        ).fetchone()
+        if not batch:
+            return "ไม่มีรายการที่ปิดล่าสุดให้ย้อนกลับครับ"
+        batch_id, ids_json, description, created_at = batch
+        try:
+            ids = json.loads(ids_json) or []
+        except (ValueError, TypeError):
+            ids = []
+        if ids:
+            conn.executemany(
+                "UPDATE file_events SET downloaded = 0, downloaded_at = NULL, downloaded_by = NULL WHERE id = ?",
+                [(i,) for i in ids]
+            )
+        conn.execute("DELETE FROM close_batches WHERE id = ?", (batch_id,))
+        when = datetime.datetime.fromisoformat(created_at).strftime("%d/%m %H:%M")
+        return (f"↩️ เปิดสถานะคืน {len(ids)} รายการแล้ว (ที่ปิด {description} เมื่อ {when} น.)\n"
+                f"{_remaining_summary(conn)}")
+    finally:
+        conn.close()
 
 # ---------- Daily backend report (CSV) ----------
 REPORT_CSV_COLUMNS = [
@@ -1378,9 +1572,9 @@ def build_overdue_flex():
     body.append({"type": "separator", "margin": "md"})
 
     for group_name, by_sender in by_group.items():
-        body.append(group_name_badge(group_name))
+        body.append(group_name_badge(group_name, with_close_button=True))
         for sender_name, items in by_sender.items():
-            body.append(txt(f"👤 {sender_name}", weight="bold", size="sm", color="#222222", margin="sm"))
+            body.append(sender_line(f"👤 {sender_name}  (ค้าง {len(items)})", group_name, sender_name, True))
             for event_type, file_name, text_content, sent_at, mention_spans in items:
                 date_str = datetime.datetime.fromisoformat(sent_at).strftime("%d/%m %H:%M")
                 if event_type == "file":
@@ -1396,8 +1590,7 @@ def build_overdue_flex():
                     ))
 
     body.append({"type": "separator", "margin": "lg"})
-    body.append(txt('พิมพ์ "โหลดแล้ว" หรือแค่ "✅" เพื่อปิดสถานะทั้งหมด หรือ "✅ <ชื่อคน>" เพื่อปิดเฉพาะคนนั้น',
-                     size="xs", color="#888888", margin="md"))
+    body.append(txt(CLOSE_HELP_TEXT, size="xs", color="#888888", margin="md"))
 
     contents = {
         "type": "bubble",
