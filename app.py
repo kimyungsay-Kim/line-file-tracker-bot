@@ -424,6 +424,9 @@ def handle_text(event):
         if text in ("ส่ง", "ยืนยัน", "confirm", "yes"):
             reply(event.reply_token, handle_inspection_confirm(user_id))
             return
+        if text in ("แจ้งส่งผิดกลุ่ม", "ส่งผิดกลุ่ม"):
+            reply(event.reply_token, handle_wrong_group_notice())
+            return
         if text in ("ยกเลิก", "cancel"):
             if get_inspection_preview(user_id) is not None:
                 clear_inspection_preview(user_id)
@@ -732,7 +735,39 @@ def handle_inspection_confirm(user_id):
         return ("โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือพิมพ์ \"ตั้งกลุ่มแจ้งเอกสาร\" "
                 "ในกลุ่มที่ต้องการก่อน" + detail)
     clear_inspection_preview(user_id)
+    try:
+        set_setting("last_inspection_post_group_id", target)
+    except Exception:
+        app.logger.exception("could not record last inspection post group")
     return f"โพสต์เข้ากลุ่ม \"{get_group_name(target)}\" เรียบร้อยแล้วครับ"
+
+WRONG_GROUP_APOLOGY = ("🙏 ขออภัยค่ะ รายการแจ้งเอกสาร Request ด้านบนส่งผิดกลุ่ม "
+                       "รบกวนไม่ต้องดำเนินการค่ะ ขอบคุณค่ะ")
+
+def handle_wrong_group_notice():
+    """Pushes an apology to the group the inspection list was last posted
+    to. LINE's Messaging API can't unsend a bot's message, so this is the
+    closest thing. Posts made before the last group was being recorded fall
+    back to the INSPECTION_TARGET_GROUP_ID env var, which is where those
+    went."""
+    target = get_setting("last_inspection_post_group_id", INSPECTION_TARGET_GROUP_ID)
+    if not target:
+        return "ไม่พบกลุ่มที่โพสต์ล่าสุดครับ"
+    try:
+        resp = requests.post(
+            LINE_PUSH_URL,
+            headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"to": target, "messages": [{"type": "text", "text": WRONG_GROUP_APOLOGY}]},
+            timeout=15,
+        )
+        app.logger.warning("wrong-group notice to %s -> HTTP %s %s", target, resp.status_code, resp.text[:300])
+        resp.raise_for_status()
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        detail = f"\n(LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})" if resp is not None else ""
+        return "ส่งข้อความแจ้งขออภัยไม่สำเร็จครับ" + detail
+    return f'ส่งข้อความแจ้งขออภัยเข้ากลุ่ม "{get_group_name(target)}" แล้วครับ'
 
 # ---------- Summary building ----------
 def build_summary_text(date=None):
