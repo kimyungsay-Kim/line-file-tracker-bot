@@ -125,6 +125,14 @@ SCHEMA_STATEMENTS = [
         created_at TEXT
     )
     """,
+    # simple key/value settings that can be changed from LINE without a
+    # redeploy (e.g. which group the inspection list gets posted to)
+    """
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """,
     # one row per close action ("โหลดแล้ว" / "✅ ..."), so "ย้อนกลับ" can
     # reopen exactly the items that action closed
     """
@@ -206,6 +214,30 @@ def get_group_name(group_id):
             return summary.group_name
     except Exception:
         return group_id
+
+def get_setting(key, default=""):
+    try:
+        conn = db()
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row and row[0] else default
+    except Exception:
+        app.logger.exception("get_setting failed for %s", key)
+        return default
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute(
+        "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.close()
+
+def inspection_target_group_id():
+    """Group set from LINE with "ตั้งกลุ่มแจ้งเอกสาร" wins; the
+    INSPECTION_TARGET_GROUP_ID env var is only the fallback."""
+    return get_setting("inspection_target_group_id", INSPECTION_TARGET_GROUP_ID)
 
 BKK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -321,6 +353,9 @@ def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_t
         json={"to": group_id, "messages": messages},
         timeout=15,
     )
+    app.logger.warning("inspection push to %s -> HTTP %s %s (request-id %s)",
+                       group_id, resp.status_code, resp.text[:300],
+                       resp.headers.get("X-Line-Request-Id"))
     resp.raise_for_status()
 
 # ---------- Webhook ----------
@@ -447,6 +482,17 @@ def handle_text(event):
     # utility: anyone can type "groupid" in a group to get its ID for setup
     if text.lower() in ("groupid", "ไอดีกลุ่ม"):
         reply(event.reply_token, f"group_id ของกลุ่มนี้คือ:\n{group_id}")
+        return
+
+    # set THIS group as where the inspection document list gets posted
+    if text in ("ตั้งกลุ่มแจ้งเอกสาร", "ตั้งกลุ่มนี้แจ้งเอกสาร"):
+        try:
+            set_setting("inspection_target_group_id", group_id)
+            reply(event.reply_token,
+                  f"ตั้งกลุ่ม \"{get_group_name(group_id)}\" เป็นกลุ่มปลายทางสำหรับแจ้งเอกสาร Request แล้วค่ะ ✅")
+        except Exception:
+            app.logger.exception("set inspection target group failed")
+            reply(event.reply_token, "ตั้งค่ากลุ่มไม่สำเร็จค่ะ ลองใหม่อีกครั้ง")
         return
 
     if not TAGGED_USER_IDS:
@@ -669,16 +715,24 @@ def handle_inspection_confirm(user_id):
     items = get_inspection_preview(user_id)
     if not items:
         return 'ไม่มีรายการที่รอยืนยันอยู่ครับ ลองวางข้อมูลเอกสารรูปแบบ "code|doc_number|subject|date" ก่อนนะครับ'
-    if not INSPECTION_TARGET_GROUP_ID:
-        return "ยังไม่ได้ตั้งค่า INSPECTION_TARGET_GROUP_ID ปลายทางครับ แจ้งผู้ดูแลระบบด้วย"
+    target = inspection_target_group_id()
+    if not target:
+        return ('ยังไม่ได้ตั้งกลุ่มปลายทางครับ ให้พิมพ์ "ตั้งกลุ่มแจ้งเอกสาร" ในกลุ่มที่ต้องการให้โพสต์ '
+                'แล้วกลับมาพิมพ์ "ส่ง" อีกครั้ง (รายการยังรออยู่)')
     alt_text, contents = build_inspection_carousel_flex(items)
     lead_alt_text, lead_contents = build_inspection_announce_flex(len(items))
     try:
-        push_mention_all_to_group(INSPECTION_TARGET_GROUP_ID, alt_text, contents, lead_alt_text, lead_contents)
-    except Exception:
-        return "โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือแจ้งผู้ดูแลระบบ"
+        push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents)
+    except Exception as e:
+        app.logger.exception("inspection push failed")
+        detail = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            detail = f"\n(LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})"
+        return ("โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือพิมพ์ \"ตั้งกลุ่มแจ้งเอกสาร\" "
+                "ในกลุ่มที่ต้องการก่อน" + detail)
     clear_inspection_preview(user_id)
-    return "โพสต์เข้ากลุ่มเรียบร้อยแล้วครับ"
+    return f"โพสต์เข้ากลุ่ม \"{get_group_name(target)}\" เรียบร้อยแล้วครับ"
 
 # ---------- Summary building ----------
 def build_summary_text(date=None):
