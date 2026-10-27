@@ -1289,41 +1289,56 @@ def after_doc_reply(code, user_id, user_name, text):
         app.logger.exception("outsider reply notice failed")
 
 def handle_set_buddy_command(event, group_id, text):
-    """Group: "ตั้งบัดดี้ AR,ST EE-A @a @b" (owner only, confirmation goes 1:1)."""
+    """Group: "ตั้งบัดดี้ AR,ST EE-A @a @b" (owner only, confirmation goes 1:1).
+    Several teams can go in one message, one "ตั้งบัดดี้" line each."""
     sender_id = event.source.user_id
     allowed = {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
     if sender_id not in allowed:
         return
     mention = getattr(event.message, "mention", None)
     mentionees = list(mention.mentionees) if mention and mention.mentionees else []
-    # strip the @name parts (LINE gives UTF-16 offsets) to read prefixes + label
-    plain, cut = text, []
+    # each @name as a Python index range (LINE gives UTF-16 offsets)
+    spans = []
     for m in mentionees:
-        if getattr(m, "index", None) is not None and getattr(m, "length", None) is not None:
-            cut.append((utf16_index_to_py(text, m.index), utf16_index_to_py(text, m.index + m.length)))
-    for start, end in sorted(cut, reverse=True):
-        plain = plain[:start] + " " + plain[end:]
-    tokens = plain.split()
-    usage = ('รูปแบบ: ตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
+        if getattr(m, "index", None) is None or getattr(m, "length", None) is None:
+            continue
+        spans.append((utf16_index_to_py(text, m.index), utf16_index_to_py(text, m.index + m.length), m))
+    usage = ('รูปแบบ: ตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2 (1 ทีมต่อบรรทัด)\n'
              '(เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา ห้ามพิมพ์ @ชื่อ เอง)')
-    if len(tokens) < 3:
-        push_to(sender_id, "ตั้งบัดดี้ไม่สำเร็จ ข้อมูลไม่ครบครับ\n" + usage)
-        return
-    prefixes = {p.strip().upper() for p in tokens[1].split(",") if p.strip()}
-    label = tokens[2].upper()
-    members = [m.user_id for m in mentionees
-               if getattr(m, "type", "user") == "user" and getattr(m, "user_id", None)]
-    if not prefixes or not all(re.fullmatch(r"[A-Z]{1,5}", p) for p in prefixes):
-        push_to(sender_id, f'ตั้งบัดดี้ไม่สำเร็จ รหัสหมวด "{tokens[1]}" ไม่ถูกต้องครับ\n' + usage)
-        return
-    if not members or len(members) < len([m for m in mentionees if getattr(m, "type", "user") == "user"]):
-        push_to(sender_id, "ตั้งบัดดี้ไม่สำเร็จ บอทไม่ได้รับรหัสของบางคนครับ\n" + usage)
-        return
-    members = list(dict.fromkeys(members))
-    save_buddy_team(label, prefixes, members, group_id)
-    names = ", ".join(get_profile_name(group_id, u) for u in members)
-    push_to(sender_id, f"✅ ตั้งบัดดี้ {label} (เอกสาร {', '.join(sorted(prefixes))}) แล้วครับ: {names}\n"
-                       "กดยกเลิกข้อความคำสั่งในกลุ่มได้เลย · ดูทั้งหมดพิมพ์ \"บัดดี้\" ในแชทนี้")
+    results, pos = [], 0
+    for line in text.split("\n"):
+        start, end = pos, pos + len(line)
+        pos = end + 1
+        if not line.strip().startswith("ตั้งบัดดี้"):
+            continue
+        in_line = [(a - start, b - start, m) for a, b, m in spans if start <= a < end]
+        plain = line
+        for a, b, _ in sorted(in_line, key=lambda x: x[0], reverse=True):
+            plain = plain[:a] + " " + plain[b:]
+        tokens = plain.split()
+        if len(tokens) < 3:
+            results.append(f"❌ \"{line.strip()[:40]}\" ข้อมูลไม่ครบ")
+            continue
+        prefixes = {p.strip().upper() for p in tokens[1].split(",") if p.strip()}
+        label = tokens[2].upper()
+        user_mentions = [m for _, _, m in in_line if getattr(m, "type", "user") == "user"]
+        members = list(dict.fromkeys(m.user_id for m in user_mentions if getattr(m, "user_id", None)))
+        if not prefixes or not all(re.fullmatch(r"[A-Z]{1,5}", p) for p in prefixes):
+            results.append(f"❌ {label}: รหัสหมวด \"{tokens[1]}\" ไม่ถูกต้อง")
+            continue
+        if not members or any(not getattr(m, "user_id", None) for m in user_mentions):
+            results.append(f"❌ {label}: บอทไม่ได้รับรหัสของบางคน (ต้องเลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา)")
+            continue
+        save_buddy_team(label, prefixes, members, group_id)
+        names = ", ".join(get_profile_name(group_id, u) for u in members)
+        results.append(f"✅ {label} (เอกสาร {', '.join(sorted(prefixes))}): {names}")
+    if not results:
+        results.append("❌ ไม่พบคำสั่งตั้งบัดดี้")
+    msg = "ตั้งบัดดี้:\n" + "\n".join(results)
+    if any(r.startswith("❌") for r in results):
+        msg += "\n\n" + usage
+    msg += '\n\nกดยกเลิกข้อความคำสั่งในกลุ่มได้เลย · ดูทั้งหมดพิมพ์ "บัดดี้" ในแชทนี้'
+    push_to(sender_id, msg)
 
 def build_buddy_list_text():
     teams = load_buddy_teams()
