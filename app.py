@@ -520,6 +520,16 @@ def handle_text(event):
                 reply(event.reply_token, alt_text)
             else:
                 reply_flex(event.reply_token, alt_text, contents)
+        elif text in ("ติดตาม", "ติดตามคำตอบ"):
+            alt_text, contents = build_followup_preview()
+            if contents is None:
+                reply(event.reply_token, alt_text)
+            else:
+                reply_flex_and_text(event.reply_token, alt_text, contents,
+                                    f'ตัวอย่างข้อความติดตามที่จะส่งเข้ากลุ่มอัตโนมัติ {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น. '
+                                    f'({REMIND_DAYS_OF_WEEK}) — ถ้าต้องการส่งตอนนี้เลย พิมพ์ "ส่งติดตาม" ครับ')
+        elif text in ("ส่งติดตาม",):
+            reply(event.reply_token, send_reply_followup(force=True))
         elif text.startswith("คำตอบ "):
             reply(event.reply_token, build_reply_thread_text(text[len("คำตอบ "):]))
         elif text in ("ย้อนกลับ", "เลิกทำ", "undo"):
@@ -1080,6 +1090,148 @@ def count_unanswered_docs():
     finally:
         conn.close()
     return row[0] if row else 0
+
+# --- Daily follow-up in the group: documents still waiting for a reply ---
+# Every working day the bot posts, into the group each document was posted to,
+# the Request PB documents from the last REMIND_WINDOW_DAYS days that nobody
+# has replied to yet (oldest first, with how many days each has waited), then
+# an @All line asking the team to answer. Groups with nothing outstanding get
+# nothing, so a fully answered day costs no LINE quota.
+#   1:1 "ติดตาม"     -> preview what would be posted (reply, free)
+#   1:1 "ส่งติดตาม"  -> post it to the group(s) right now
+REMIND_HOUR = int(os.environ.get("REMIND_HOUR", "9"))
+REMIND_MINUTE = int(os.environ.get("REMIND_MINUTE", "0"))
+REMIND_DAYS_OF_WEEK = os.environ.get("REMIND_DAYS_OF_WEEK", "mon-sat")  # APScheduler day_of_week syntax
+REMIND_WINDOW_DAYS = int(os.environ.get("REMIND_WINDOW_DAYS", str(REPLIES_OVERVIEW_DAYS)))
+REMIND_LATE_DAYS = int(os.environ.get("REMIND_LATE_DAYS", "3"))   # waited this long or more -> red
+REMIND_MAX_DOCS = 25
+REMIND_MENTION_TEXT = os.environ.get(
+    "REMIND_MENTION_TEXT",
+    "รบกวนตรวจสอบและตอบกลับเอกสาร Request PB ที่ยังค้างด้านบนด้วยนะคะ "
+    'กด "💬 ตอบกลับ" ใต้เอกสาร หรือพิมพ์รหัสตามด้วยข้อความในกลุ่ม เช่น "AR-337 ตรวจแล้ว" ค่ะ',
+)
+REMIND_HEADER_COLOR = "#E65100"
+REMIND_WAIT_COLOR = "#EF6C00"
+
+def get_unanswered_docs_by_group():
+    """{group_id: [(code, subject, date, posted_at), ...]} oldest first."""
+    since = (bkk_now() - datetime.timedelta(days=REMIND_WINDOW_DAYS)).isoformat()
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT d.group_id, d.code, d.subject, d.date, d.posted_at FROM inspection_docs d "
+            "WHERE d.posted_at >= ? AND NOT EXISTS (SELECT 1 FROM doc_replies r WHERE r.code = d.code) "
+            "ORDER BY d.posted_at, d.code",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = {}
+    for group_id, code, subject, date, posted_at in rows:
+        out.setdefault(group_id or "", []).append((code, subject, date, posted_at))
+    return out
+
+def _days_waiting(posted_at):
+    try:
+        posted = datetime.datetime.fromisoformat(posted_at).date()
+    except (ValueError, TypeError):
+        return 0
+    return max((bkk_today() - posted).days, 0)
+
+def build_followup_flex(docs):
+    txt = flex_txt
+    late = sum(1 for d in docs if _days_waiting(d[3]) >= REMIND_LATE_DAYS)
+    body = [
+        txt("🔔 ติดตามการตอบกลับเอกสาร Request PB", weight="bold", size="md", color=REMIND_HEADER_COLOR),
+        {"type": "text", "wrap": True, "size": "xs", "color": "#666666", "margin": "xs", "contents": [
+            {"type": "span", "text": "ยังไม่มีคำตอบ "},
+            {"type": "span", "text": f"{len(docs)} ฉบับ", "weight": "bold", "color": OVERDUE_COLOR},
+            {"type": "span", "text": (f" · ค้างเกิน {REMIND_LATE_DAYS} วัน {late} ฉบับ" if late else "")
+                                     + f" · ข้อมูล ณ {bkk_now().strftime('%d/%m %H:%M')} น."},  # never empty
+        ]},
+        {"type": "separator", "margin": "md"},
+    ]
+    for code, subject, date, posted_at in docs[:REMIND_MAX_DOCS]:
+        waited = _days_waiting(posted_at)
+        color = OVERDUE_COLOR if waited >= REMIND_LATE_DAYS else REMIND_WAIT_COLOR
+        wait_label = "โพสต์วันนี้" if waited == 0 else f"รอ {waited} วัน"
+        body.append(two_tone_text(f"{'🔴' if waited >= REMIND_LATE_DAYS else '🟠'} {code}", color,
+                                  f"  ({wait_label})", size="sm", margin="md"))
+        body.append(txt(subject or "-", size="xs", color="#444444", margin="none"))
+        meta = [txt(f"ส่งเข้าระบบ {date}" if date else "-", size="xxs", color="#999999", flex=1)]
+        link = doc_reply_liff_url(code)
+        if link:
+            meta.append({"type": "text", "text": "💬 ตอบกลับ", "size": "xs", "weight": "bold",
+                         "color": REPLY_LINK_COLOR, "align": "end", "flex": 0,
+                         "action": {"type": "uri", "label": "ตอบกลับ", "uri": link}})
+        body.append({"type": "box", "layout": "horizontal", "margin": "none", "contents": meta})
+    if len(docs) > REMIND_MAX_DOCS:
+        body.append(txt(f"… และอีก {len(docs) - REMIND_MAX_DOCS} ฉบับ", size="xs", color="#999999", margin="md"))
+    contents = {"type": "bubble", "size": "giga",
+                "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body}}
+    return (f"🔔 ติดตามการตอบกลับเอกสาร Request PB: ยังไม่มีคำตอบ {len(docs)} ฉบับ", contents)
+
+def push_followup_to_group(group_id, alt_text, contents):
+    messages = [
+        {"type": "flex", "altText": alt_text, "contents": contents},
+        {"type": "textV2", "text": f"{{user1}} {REMIND_MENTION_TEXT}",
+         "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}}},
+    ]
+    resp = requests.post(
+        LINE_PUSH_URL,
+        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
+        json={"to": group_id, "messages": messages},
+        timeout=15,
+    )
+    app.logger.warning("follow-up push to %s -> HTTP %s %s", group_id, resp.status_code, resp.text[:300])
+    resp.raise_for_status()
+
+def send_reply_followup(force=False):
+    """Posts the follow-up to every group with unanswered documents. Returns a
+    short Thai status line. The scheduled run (force=False) sends at most once
+    per day, so a restart around the scheduled minute can't double-post."""
+    today = bkk_today().isoformat()
+    if not force and get_setting("reply_followup_last_sent", "") == today:
+        return "วันนี้ส่งติดตามไปแล้วครับ"
+    by_group = get_unanswered_docs_by_group()
+    if not by_group:
+        set_setting("reply_followup_last_sent", today)
+        return "ทุกเอกสารมีคำตอบแล้ว ไม่ต้องส่งติดตามครับ 🎉"
+    sent, failed = [], []
+    for group_id, docs in by_group.items():
+        target = group_id or inspection_target_group_id()
+        if not target:
+            failed.append(f"{len(docs)} ฉบับ (ไม่รู้กลุ่มปลายทาง)")
+            continue
+        alt_text, contents = build_followup_flex(docs)
+        try:
+            push_followup_to_group(target, alt_text, contents)
+            sent.append(f'"{get_group_name(target)}" {len(docs)} ฉบับ')
+        except Exception as e:
+            app.logger.exception("follow-up push failed")
+            failed.append(f'"{get_group_name(target)}" ({e})')
+    if sent:
+        set_setting("reply_followup_last_sent", today)
+    lines = []
+    if sent:
+        lines.append("ส่งติดตามคำตอบเข้ากลุ่มแล้ว: " + ", ".join(sent))
+    if failed:
+        lines.append("ส่งไม่สำเร็จ: " + ", ".join(failed))
+    return "\n".join(lines)
+
+def scheduled_reply_followup():
+    try:
+        send_reply_followup()
+    except Exception:
+        app.logger.exception("scheduled reply follow-up failed")
+
+def build_followup_preview():
+    by_group = get_unanswered_docs_by_group()
+    if not by_group:
+        return ("ทุกเอกสารในช่วง %d วันล่าสุดมีคำตอบแล้วครับ 🎉" % REMIND_WINDOW_DAYS, None)
+    docs = [d for group_docs in by_group.values() for d in group_docs]
+    docs.sort(key=lambda d: (d[3] or "", d[0]))
+    return build_followup_flex(docs)
 
 # --- LIFF page + JSON API ---
 LINE_VERIFY_ID_TOKEN_URL = "https://api.line.me/oauth2/v2.1/verify"
@@ -2192,6 +2344,8 @@ def send_overdue_digest():
 scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 scheduler.add_job(send_daily_digest, "cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
 scheduler.add_job(send_overdue_digest, "cron", hour=OVERDUE_HOUR, minute=OVERDUE_MINUTE)
+scheduler.add_job(scheduled_reply_followup, "cron", day_of_week=REMIND_DAYS_OF_WEEK,
+                  hour=REMIND_HOUR, minute=REMIND_MINUTE)
 scheduler.start()
 
 @app.route("/", methods=["GET"])
