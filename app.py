@@ -166,6 +166,16 @@ SCHEMA_STATEMENTS = [
         posted_at TEXT
     )
     """,
+    # buddy teams: who must answer posted documents (see "Buddy teams")
+    """
+    CREATE TABLE IF NOT EXISTS buddy_teams (
+        label TEXT PRIMARY KEY,
+        prefixes TEXT,
+        member_ids TEXT,
+        group_id TEXT,
+        updated_at TEXT
+    )
+    """,
     # replies typed by the team about a posted document - many per document
     """
     CREATE TABLE IF NOT EXISTS doc_replies (
@@ -223,6 +233,10 @@ def init_db_schema():
     try:
         for stmt in SCHEMA_STATEMENTS:
             client.execute(stmt)
+        try:  # added later: owner can close a doc by hand ("ปิดเอกสาร AR-337")
+            client.execute("ALTER TABLE inspection_docs ADD COLUMN closed_at TEXT")
+        except Exception:
+            pass  # column already there
     finally:
         client.close()
 
@@ -521,13 +535,23 @@ def handle_text(event):
             else:
                 reply_flex(event.reply_token, alt_text, contents)
         elif text in ("ติดตาม", "ติดตามคำตอบ"):
-            alt_text, contents = build_followup_preview()
+            alt_text, contents, who = build_followup_preview()
             if contents is None:
                 reply(event.reply_token, alt_text)
             else:
                 reply_flex_and_text(event.reply_token, alt_text, contents,
-                                    f'ตัวอย่างข้อความติดตามที่จะส่งเข้ากลุ่มอัตโนมัติ {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น. '
+                                    f'{who}\n\nตัวอย่างข้อความติดตามที่จะส่งเข้ากลุ่มอัตโนมัติ {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น. '
                                     f'({REMIND_DAYS_OF_WEEK}) — ถ้าต้องการส่งตอนนี้เลย พิมพ์ "ส่งติดตาม" ครับ')
+        elif text in ("บัดดี้", "ผู้รับผิดชอบ"):
+            reply(event.reply_token, build_buddy_list_text())
+        elif text.startswith("ลบบัดดี้ "):
+            label = text[len("ลบบัดดี้ "):].strip().upper()
+            reply(event.reply_token, f"ลบบัดดี้ {label} แล้วครับ" if delete_buddy_team(label)
+                  else f"ไม่พบบัดดี้ชื่อ {label} ครับ (พิมพ์ \"บัดดี้\" เพื่อดูรายชื่อ)")
+        elif text.startswith("ปิดเอกสาร "):
+            reply(event.reply_token, set_doc_closed(text[len("ปิดเอกสาร "):], True))
+        elif text.startswith("เปิดเอกสาร "):
+            reply(event.reply_token, set_doc_closed(text[len("เปิดเอกสาร "):], False))
         elif text in ("ส่งติดตาม",):
             reply(event.reply_token, send_reply_followup(force=True))
         elif text.startswith("คำตอบ "):
@@ -571,6 +595,14 @@ def handle_text(event):
                 push_to(sender_id, "ตั้งค่ากลุ่มไม่สำเร็จค่ะ ลองใหม่อีกครั้ง")
             except Exception:
                 app.logger.exception("could not notify owner")
+        return
+
+    # set a buddy team (owner only; confirmation goes to the owner's 1:1 chat)
+    if text.startswith("ตั้งบัดดี้"):
+        try:
+            handle_set_buddy_command(event, group_id, text)
+        except Exception:
+            app.logger.exception("set buddy team failed")
         return
 
     # shortcut reply: "AR-337 ตรวจแล้ว เหลือแก้รอยต่อฝ้า" saves a reply to
@@ -989,7 +1021,10 @@ def record_group_reply_shortcut(group_id, user_id, text):
     if not get_inspection_doc(code):
         return False
     name = get_profile_name(group_id, user_id) if user_id else "ไม่ทราบชื่อ"
-    return add_doc_reply(code, user_id, name, m.group(3), "group")
+    saved = add_doc_reply(code, user_id, name, m.group(3), "group")
+    if saved:
+        after_doc_reply(code, user_id, name, m.group(3).strip())
+    return saved
 
 def _fmt_dt(iso):
     try:
@@ -998,68 +1033,61 @@ def _fmt_dt(iso):
         return ""
 
 def build_replies_overview_flex():
-    """1:1 "คำตอบ": recently posted documents with how many replies each has,
-    the latest reply, and the ones nobody has answered yet listed first."""
-    since = (bkk_now() - datetime.timedelta(days=REPLIES_OVERVIEW_DAYS)).isoformat()
-    conn = db()
-    try:
-        docs = conn.execute(
-            "SELECT d.code, d.subject, d.posted_at, "
-            "  (SELECT COUNT(*) FROM doc_replies r WHERE r.code = d.code), "
-            "  (SELECT r.user_name || ': ' || r.text FROM doc_replies r WHERE r.code = d.code "
-            "     ORDER BY r.created_at DESC, r.id DESC LIMIT 1) "
-            "FROM inspection_docs d WHERE d.posted_at >= ? ORDER BY d.posted_at DESC, d.code",
-            (since,),
-        ).fetchall()
-    finally:
-        conn.close()
-
+    """1:1 "คำตอบ": recently posted documents, the ones still waiting first,
+    with which buddy teams have answered and the latest reply."""
+    docs = list(reversed(get_docs_status(REPLIES_OVERVIEW_DAYS)))  # newest first
     if not docs:
         return (f"ยังไม่มีเอกสารที่โพสต์เข้ากลุ่มในช่วง {REPLIES_OVERVIEW_DAYS} วันที่ผ่านมาครับ", None)
 
-    unanswered = [d for d in docs if not d[3]]
-    answered = [d for d in docs if d[3]]
+    pending = [d for d in docs if d["pending"]]
+    done = [d for d in docs if not d["pending"]]
     txt = flex_txt
     body = [txt("💬 คำตอบเอกสาร", weight="bold", size="lg", color="#111111"),
             txt(f"{REPLIES_OVERVIEW_DAYS} วันล่าสุด · ทั้งหมด {len(docs)} ฉบับ · "
-                f"ยังไม่มีคำตอบ {len(unanswered)} ฉบับ",
+                f"ยังรอคำตอบ {len(pending)} ฉบับ",
                 size="xs", color="#888888", margin="xs"),
             {"type": "separator", "margin": "md"}]
 
     shown = 0
-    def doc_block(code, subject, n, latest, color):
-        block = [two_tone_text(code, color, f"  ({n} คำตอบ)" if n else "  (ยังไม่มีคำตอบ)",
-                               size="sm", margin="md")]
-        block.append(txt(subject, size="xs", color="#444444", margin="none"))
-        if latest:
-            preview = latest.replace("\n", " ")
+    def doc_block(d, color):
+        if d["closed"]:
+            suffix = "  (🔒 ปิดโดยแอดมิน)"
+        else:
+            suffix = f"  ({d['n']} คำตอบ)" if d["n"] else "  (ยังไม่มีคำตอบ)"
+        block = [two_tone_text(d["code"], color, suffix, size="sm", margin="md")]
+        block.append(txt(d["subject"] or "-", size="xs", color="#444444", margin="none"))
+        if d["status"]:
+            block.append(txt(team_status_line(d["status"]), size="xs", color="#333333", margin="none"))
+        if d["latest"]:
+            preview = d["latest"].replace("\n", " ")
             block.append(txt(f"↳ {preview[:120]}{'…' if len(preview) > 120 else ''}",
                              size="xs", color="#0B6E4F", margin="none"))
         return block
 
-    if unanswered:
-        body.append(txt("🔴 ยังไม่มีคำตอบ", weight="bold", size="sm", color=OVERDUE_COLOR, margin="md"))
-        for code, subject, _, n, latest in unanswered:
+    if pending:
+        body.append(txt("🔴 ยังรอคำตอบ", weight="bold", size="sm", color=OVERDUE_COLOR, margin="md"))
+        for d in pending:
             if shown >= REPLIES_OVERVIEW_MAX_DOCS:
                 break
-            body.extend(doc_block(code, subject, n, latest, OVERDUE_COLOR))
+            body.extend(doc_block(d, OVERDUE_COLOR))
             shown += 1
-    if answered and shown < REPLIES_OVERVIEW_MAX_DOCS:
+    if done and shown < REPLIES_OVERVIEW_MAX_DOCS:
         body.append({"type": "separator", "margin": "lg"})
-        body.append(txt("✅ มีคำตอบแล้ว", weight="bold", size="sm", color="#0B6E4F", margin="md"))
-        for code, subject, _, n, latest in answered:
+        body.append(txt("✅ ตอบครบแล้ว", weight="bold", size="sm", color="#0B6E4F", margin="md"))
+        for d in done:
             if shown >= REPLIES_OVERVIEW_MAX_DOCS:
                 break
-            body.extend(doc_block(code, subject, n, latest, "#0D47A1"))
+            body.extend(doc_block(d, "#0D47A1"))
             shown += 1
     if shown < len(docs):
         body.append(txt(f"… มีอีก {len(docs) - shown} ฉบับที่ไม่ได้แสดง", size="xs", color="#999999", margin="md"))
 
     body.append({"type": "separator", "margin": "lg"})
-    body.append(txt('ดูคำตอบทั้งหมดของเอกสาร: พิมพ์ "คำตอบ AR-337"', size="xs", color="#888888", margin="md"))
+    body.append(txt('ดูคำตอบทั้งหมดของเอกสาร: พิมพ์ "คำตอบ AR-337" · ปิดเอง: "ปิดเอกสาร AR-337"',
+                    size="xs", color="#888888", margin="md"))
     contents = {"type": "bubble",
                 "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body}}
-    return (f"คำตอบเอกสาร: ยังไม่มีคำตอบ {len(unanswered)} จาก {len(docs)} ฉบับ", contents)
+    return (f"คำตอบเอกสาร: ยังรอคำตอบ {len(pending)} จาก {len(docs)} ฉบับ", contents)
 
 def build_reply_thread_text(raw_code):
     code = normalize_doc_code(raw_code)
@@ -1079,24 +1107,240 @@ def build_reply_thread_text(raw_code):
     return text if len(text) <= 4900 else text[:4900] + "\n…(ยาวเกิน แสดงไม่ครบ)"
 
 def count_unanswered_docs():
-    since = (bkk_now() - datetime.timedelta(days=REPLIES_OVERVIEW_DAYS)).isoformat()
+    return sum(1 for d in get_docs_status(REPLIES_OVERVIEW_DAYS) if d["pending"])
+
+# --- Buddy teams: who must answer each posted document ---
+# The owner sets a team per system in the group, picking names from LINE's
+# mention popup so the bot gets each person's user ID (display names can
+# change freely - LINE always renders the current name in a mention):
+#     ตั้งบัดดี้ AR,ST EE-A @นายA @นายB
+#     ตั้งบัดดี้ AR,ST AC @นายC @นายD
+# A document whose code prefix (AR, ST, ...) has teams needs an answer from
+# every SYSTEM; within a team one member's reply counts for the whole team.
+# Teams named "<system>-<building>" (EE-A, EE-B) split one system by building:
+# the subject is searched for "อาคาร A"/"ตึก B"/...; one building found ->
+# only that team counts, none or both found -> either team's reply counts.
+# A reply from someone outside the doc's teams (and not the owner) is kept
+# but doesn't count; the owner gets a 1:1 heads-up and may close the doc
+# with "ปิดเอกสาร <code>". Prefixes with no team keep the old rule (any reply).
+BUILDING_RE = re.compile(
+    r"(?:อาคาร|ตึก|building|bldg\.?|bld\.?|zone|โซน)\s*[-:.]?\s*([AB])(?![A-Za-z])", re.IGNORECASE)
+TEAM_SPLIT_RE = re.compile(r"^(.+)-([A-Z0-9])$")
+
+def detect_buildings(subject):
+    return {b.upper() for b in BUILDING_RE.findall(subject or "")}
+
+def team_system(label):
+    m = TEAM_SPLIT_RE.match(label)
+    return (m.group(1), m.group(2)) if m else (label, None)
+
+def doc_prefix(code):
+    return (code or "").split("-")[0].upper()
+
+def load_buddy_teams():
     conn = db()
     try:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM inspection_docs d WHERE d.posted_at >= ? AND NOT EXISTS "
-            "(SELECT 1 FROM doc_replies r WHERE r.code = d.code)",
-            (since,),
-        ).fetchone()
+        rows = conn.execute(
+            "SELECT label, prefixes, member_ids, group_id FROM buddy_teams ORDER BY label").fetchall()
     finally:
         conn.close()
-    return row[0] if row else 0
+    teams = []
+    for label, prefixes, member_ids, group_id in rows:
+        system, building = team_system(label)
+        teams.append({"label": label, "system": system, "building": building,
+                      "prefixes": {p for p in (prefixes or "").split(",") if p},
+                      "members": json.loads(member_ids or "[]"), "group_id": group_id})
+    return teams
+
+def save_buddy_team(label, prefixes, members, group_id):
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO buddy_teams (label, prefixes, member_ids, group_id, updated_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(label) DO UPDATE SET prefixes = excluded.prefixes, member_ids = excluded.member_ids, "
+            "group_id = excluded.group_id, updated_at = excluded.updated_at",
+            (label, ",".join(sorted(prefixes)), json.dumps(members), group_id, bkk_now().isoformat()))
+    finally:
+        conn.close()
+
+def delete_buddy_team(label):
+    conn = db()
+    try:
+        found = conn.execute("SELECT 1 FROM buddy_teams WHERE label = ?", (label,)).fetchone()
+        conn.execute("DELETE FROM buddy_teams WHERE label = ?", (label,))
+    finally:
+        conn.close()
+    return bool(found)
+
+def doc_team_status(code, subject, teams, replier_ids):
+    """[{label, done, tag_ids}] per system this doc needs, or None when no
+    team covers the doc's prefix (old rule: any reply answers it)."""
+    prefix = doc_prefix(code)
+    applicable = [t for t in teams if prefix in t["prefixes"]]
+    if not applicable:
+        return None
+    systems = []
+    for t in applicable:
+        if t["system"] not in systems:
+            systems.append(t["system"])
+    out = []
+    for system in systems:
+        subs = [t for t in applicable if t["system"] == system]
+        need = subs
+        if len(subs) > 1 or subs[0]["building"]:
+            found = detect_buildings(subject)
+            named = [t for t in subs if t["building"] in found]
+            if len(found) == 1 and named:
+                need = named
+        if len(need) == 1:
+            label = need[0]["label"]
+        else:
+            label = f"{system} ({'/'.join(t['building'] or t['label'] for t in need)})"
+        members = [u for t in need for u in t["members"]]
+        done = bool(set(members) & replier_ids)
+        out.append({"label": label, "done": done, "tag_ids": [] if done else members})
+    return out
+
+def get_docs_status(days):
+    """Every doc posted in the last `days` days with its reply state, oldest first."""
+    since = (bkk_now() - datetime.timedelta(days=days)).isoformat()
+    conn = db()
+    try:
+        docs = conn.execute(
+            "SELECT code, subject, date, posted_at, group_id, closed_at FROM inspection_docs "
+            "WHERE posted_at >= ? ORDER BY posted_at, code", (since,)).fetchall()
+        replies = conn.execute(
+            "SELECT r.code, r.user_id, r.user_name, r.text FROM doc_replies r "
+            "JOIN inspection_docs d ON d.code = r.code WHERE d.posted_at >= ? "
+            "ORDER BY r.created_at, r.id", (since,)).fetchall()
+    finally:
+        conn.close()
+    by_code = {}
+    for code, uid, name, text in replies:
+        info = by_code.setdefault(code, {"ids": set(), "n": 0, "latest": None})
+        info["ids"].add(uid)
+        info["n"] += 1
+        info["latest"] = f"{name}: {text}"
+    teams = load_buddy_teams()
+    out = []
+    for code, subject, date, posted_at, group_id, closed_at in docs:
+        info = by_code.get(code, {"ids": set(), "n": 0, "latest": None})
+        status = doc_team_status(code, subject, teams, info["ids"])
+        if closed_at:
+            pending = False
+        elif status is None:
+            pending = info["n"] == 0
+        else:
+            pending = not all(s["done"] for s in status)
+        out.append({"code": code, "subject": subject, "date": date, "posted_at": posted_at,
+                    "group_id": group_id or "", "closed": bool(closed_at), "status": status,
+                    "n": info["n"], "latest": info["latest"], "pending": pending})
+    return out
+
+def team_status_line(status):
+    return "   ".join(f"{'✅' if s['done'] else '⏳'} {s['label']}" for s in status)
+
+def set_doc_closed(raw_code, closed):
+    code = normalize_doc_code(raw_code)
+    if not code:
+        return 'พิมพ์รหัสเอกสารให้ถูกรูปแบบครับ เช่น "ปิดเอกสาร AR-337"'
+    if not get_inspection_doc(code):
+        return f"ไม่พบเอกสาร {code} ในรายการที่เคยโพสต์เข้ากลุ่มครับ"
+    conn = db()
+    try:
+        conn.execute("UPDATE inspection_docs SET closed_at = ? WHERE code = ?",
+                     (bkk_now().isoformat() if closed else None, code))
+    finally:
+        conn.close()
+    if closed:
+        return f"🔒 ปิดเอกสาร {code} แล้วครับ จะไม่อยู่ในรายการติดตามอีก (เปิดคืน: \"เปิดเอกสาร {code}\")"
+    return f"🔓 เปิดเอกสาร {code} คืนแล้วครับ"
+
+def notify_owner_outsider_reply(code, user_id, user_name, text):
+    """Heads-up to the owner when someone outside the doc's buddy teams replies."""
+    if not OWNER_USER_ID or user_id == OWNER_USER_ID:
+        return
+    doc = get_inspection_doc(code)
+    if not doc:
+        return
+    applicable = [t for t in load_buddy_teams() if doc_prefix(code) in t["prefixes"]]
+    if not applicable or any(user_id in t["members"] for t in applicable):
+        return
+    preview = text if len(text) <= 300 else text[:300] + "…"
+    push_to_owner(
+        f"📝 มีคำตอบจากคนนอกทีมผู้รับผิดชอบ\n{code} · {doc['subject']}\n"
+        f"👤 {user_name}: {preview}\n\n"
+        f"คำตอบนี้ยังไม่นับให้ระบบใด ถ้าตรวจแล้วต้องการปิดเอกสาร พิมพ์ \"ปิดเอกสาร {code}\" ครับ")
+
+def after_doc_reply(code, user_id, user_name, text):
+    try:
+        notify_owner_outsider_reply(code, user_id, user_name, text)
+    except Exception:
+        app.logger.exception("outsider reply notice failed")
+
+def handle_set_buddy_command(event, group_id, text):
+    """Group: "ตั้งบัดดี้ AR,ST EE-A @a @b" (owner only, confirmation goes 1:1)."""
+    sender_id = event.source.user_id
+    allowed = {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
+    if sender_id not in allowed:
+        return
+    mention = getattr(event.message, "mention", None)
+    mentionees = list(mention.mentionees) if mention and mention.mentionees else []
+    # strip the @name parts (LINE gives UTF-16 offsets) to read prefixes + label
+    plain, cut = text, []
+    for m in mentionees:
+        if getattr(m, "index", None) is not None and getattr(m, "length", None) is not None:
+            cut.append((utf16_index_to_py(text, m.index), utf16_index_to_py(text, m.index + m.length)))
+    for start, end in sorted(cut, reverse=True):
+        plain = plain[:start] + " " + plain[end:]
+    tokens = plain.split()
+    usage = ('รูปแบบ: ตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
+             '(เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา ห้ามพิมพ์ @ชื่อ เอง)')
+    if len(tokens) < 3:
+        push_to(sender_id, "ตั้งบัดดี้ไม่สำเร็จ ข้อมูลไม่ครบครับ\n" + usage)
+        return
+    prefixes = {p.strip().upper() for p in tokens[1].split(",") if p.strip()}
+    label = tokens[2].upper()
+    members = [m.user_id for m in mentionees
+               if getattr(m, "type", "user") == "user" and getattr(m, "user_id", None)]
+    if not prefixes or not all(re.fullmatch(r"[A-Z]{1,5}", p) for p in prefixes):
+        push_to(sender_id, f'ตั้งบัดดี้ไม่สำเร็จ รหัสหมวด "{tokens[1]}" ไม่ถูกต้องครับ\n' + usage)
+        return
+    if not members or len(members) < len([m for m in mentionees if getattr(m, "type", "user") == "user"]):
+        push_to(sender_id, "ตั้งบัดดี้ไม่สำเร็จ บอทไม่ได้รับรหัสของบางคนครับ\n" + usage)
+        return
+    members = list(dict.fromkeys(members))
+    save_buddy_team(label, prefixes, members, group_id)
+    names = ", ".join(get_profile_name(group_id, u) for u in members)
+    push_to(sender_id, f"✅ ตั้งบัดดี้ {label} (เอกสาร {', '.join(sorted(prefixes))}) แล้วครับ: {names}\n"
+                       "กดยกเลิกข้อความคำสั่งในกลุ่มได้เลย · ดูทั้งหมดพิมพ์ \"บัดดี้\" ในแชทนี้")
+
+def build_buddy_list_text():
+    teams = load_buddy_teams()
+    if not teams:
+        return ('ยังไม่ได้ตั้งบัดดี้ครับ ตั้งในกลุ่มด้วย:\nตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
+                '(เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา)')
+    lines = ["👥 บัดดี้ผู้รับผิดชอบตอบเอกสาร"]
+    for t in teams:
+        names = ", ".join(get_profile_name(t["group_id"], u) for u in t["members"])
+        lines.append(f"• {t['label']} ({', '.join(sorted(t['prefixes']))}): {names}")
+    lines.append('\nลบ: "ลบบัดดี้ EE-A" · เปลี่ยนคน: ส่ง "ตั้งบัดดี้" ชื่อเดิมทับในกลุ่ม')
+    return "\n".join(lines)
+
+def group_member_ok(group_id, user_id):
+    try:
+        resp = requests.get(f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}",
+                            headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}, timeout=10)
+        return resp.status_code != 404
+    except Exception:
+        return True  # can't tell - try the mention anyway
 
 # --- Daily follow-up in the group: documents still waiting for a reply ---
 # Every working day the bot posts, into the group each document was posted to,
-# the Request PB documents from the last REMIND_WINDOW_DAYS days that nobody
-# has replied to yet (oldest first, with how many days each has waited), then
-# an @All line asking the team to answer. Groups with nothing outstanding get
-# nothing, so a fully answered day costs no LINE quota.
+# the Request PB documents from the last REMIND_WINDOW_DAYS days still waiting
+# for an answer (oldest first, days waited, which buddy teams are still due),
+# then tags exactly the people whose team still owes an answer (@All for docs
+# with no team set). Groups with nothing outstanding get nothing.
 #   1:1 "ติดตาม"     -> preview what would be posted (reply, free)
 #   1:1 "ส่งติดตาม"  -> post it to the group(s) right now
 REMIND_HOUR = int(os.environ.get("REMIND_HOUR", "9"))
@@ -1105,6 +1349,7 @@ REMIND_DAYS_OF_WEEK = os.environ.get("REMIND_DAYS_OF_WEEK", "mon-sat")  # APSche
 REMIND_WINDOW_DAYS = int(os.environ.get("REMIND_WINDOW_DAYS", str(REPLIES_OVERVIEW_DAYS)))
 REMIND_LATE_DAYS = int(os.environ.get("REMIND_LATE_DAYS", "3"))   # waited this long or more -> red
 REMIND_MAX_DOCS = 25
+REMIND_MAX_MENTIONS = 20
 REMIND_MENTION_TEXT = os.environ.get(
     "REMIND_MENTION_TEXT",
     "รบกวนตรวจสอบและตอบกลับเอกสาร Request PB ที่ยังค้างด้านบนด้วยนะคะ "
@@ -1114,21 +1359,11 @@ REMIND_HEADER_COLOR = "#E65100"
 REMIND_WAIT_COLOR = "#EF6C00"
 
 def get_unanswered_docs_by_group():
-    """{group_id: [(code, subject, date, posted_at), ...]} oldest first."""
-    since = (bkk_now() - datetime.timedelta(days=REMIND_WINDOW_DAYS)).isoformat()
-    conn = db()
-    try:
-        rows = conn.execute(
-            "SELECT d.group_id, d.code, d.subject, d.date, d.posted_at FROM inspection_docs d "
-            "WHERE d.posted_at >= ? AND NOT EXISTS (SELECT 1 FROM doc_replies r WHERE r.code = d.code) "
-            "ORDER BY d.posted_at, d.code",
-            (since,),
-        ).fetchall()
-    finally:
-        conn.close()
+    """{group_id: [doc dict, ...]} for docs still waiting, oldest first."""
     out = {}
-    for group_id, code, subject, date, posted_at in rows:
-        out.setdefault(group_id or "", []).append((code, subject, date, posted_at))
+    for d in get_docs_status(REMIND_WINDOW_DAYS):
+        if d["pending"]:
+            out.setdefault(d["group_id"], []).append(d)
     return out
 
 def _days_waiting(posted_at):
@@ -1138,27 +1373,45 @@ def _days_waiting(posted_at):
         return 0
     return max((bkk_today() - posted).days, 0)
 
+def followup_tag_targets(docs):
+    """(user_ids to mention, needs @All) for a list of pending docs."""
+    ids, need_all = [], False
+    for d in docs:
+        if d["status"] is None:
+            need_all = True
+            continue
+        for s in d["status"]:
+            for u in s["tag_ids"]:
+                if u not in ids:
+                    ids.append(u)
+    if len(ids) > REMIND_MAX_MENTIONS:
+        return ([], True)
+    return (ids, need_all)
+
 def build_followup_flex(docs):
     txt = flex_txt
-    late = sum(1 for d in docs if _days_waiting(d[3]) >= REMIND_LATE_DAYS)
+    late = sum(1 for d in docs if _days_waiting(d["posted_at"]) >= REMIND_LATE_DAYS)
     body = [
         txt("🔔 ติดตามการตอบกลับเอกสาร Request PB", weight="bold", size="md", color=REMIND_HEADER_COLOR),
         {"type": "text", "wrap": True, "size": "xs", "color": "#666666", "margin": "xs", "contents": [
-            {"type": "span", "text": "ยังไม่มีคำตอบ "},
+            {"type": "span", "text": "ยังรอคำตอบ "},
             {"type": "span", "text": f"{len(docs)} ฉบับ", "weight": "bold", "color": OVERDUE_COLOR},
             {"type": "span", "text": (f" · ค้างเกิน {REMIND_LATE_DAYS} วัน {late} ฉบับ" if late else "")
                                      + f" · ข้อมูล ณ {bkk_now().strftime('%d/%m %H:%M')} น."},  # never empty
         ]},
         {"type": "separator", "margin": "md"},
     ]
-    for code, subject, date, posted_at in docs[:REMIND_MAX_DOCS]:
-        waited = _days_waiting(posted_at)
+    for d in docs[:REMIND_MAX_DOCS]:
+        code = d["code"]
+        waited = _days_waiting(d["posted_at"])
         color = OVERDUE_COLOR if waited >= REMIND_LATE_DAYS else REMIND_WAIT_COLOR
         wait_label = "โพสต์วันนี้" if waited == 0 else f"รอ {waited} วัน"
         body.append(two_tone_text(f"{'🔴' if waited >= REMIND_LATE_DAYS else '🟠'} {code}", color,
                                   f"  ({wait_label})", size="sm", margin="md"))
-        body.append(txt(subject or "-", size="xs", color="#444444", margin="none"))
-        meta = [txt(f"ส่งเข้าระบบ {date}" if date else "-", size="xxs", color="#999999", flex=1)]
+        body.append(txt(d["subject"] or "-", size="xs", color="#444444", margin="none"))
+        if d["status"]:
+            body.append(txt(team_status_line(d["status"]), size="xs", color="#333333", margin="xs"))
+        meta = [txt(f"ส่งเข้าระบบ {d['date']}" if d["date"] else "-", size="xxs", color="#999999", flex=1)]
         link = doc_reply_liff_url(code)
         if link:
             meta.append({"type": "text", "text": "💬 ตอบกลับ", "size": "xs", "weight": "bold",
@@ -1169,14 +1422,21 @@ def build_followup_flex(docs):
         body.append(txt(f"… และอีก {len(docs) - REMIND_MAX_DOCS} ฉบับ", size="xs", color="#999999", margin="md"))
     contents = {"type": "bubble", "size": "giga",
                 "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body}}
-    return (f"🔔 ติดตามการตอบกลับเอกสาร Request PB: ยังไม่มีคำตอบ {len(docs)} ฉบับ", contents)
+    return (f"🔔 ติดตามการตอบกลับเอกสาร Request PB: ยังรอคำตอบ {len(docs)} ฉบับ", contents)
 
-def push_followup_to_group(group_id, alt_text, contents):
-    messages = [
-        {"type": "flex", "altText": alt_text, "contents": contents},
-        {"type": "textV2", "text": f"{{user1}} {REMIND_MENTION_TEXT}",
-         "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}}},
-    ]
+def build_followup_mention_message(user_ids, need_all):
+    keys, subs = [], {}
+    if need_all or not user_ids:
+        keys.append("{all}")
+        subs["all"] = {"type": "mention", "mentionee": {"type": "all"}}
+    for i, uid in enumerate(user_ids, 1):
+        keys.append(f"{{u{i}}}")
+        subs[f"u{i}"] = {"type": "mention", "mentionee": {"type": "user", "userId": uid}}
+    return {"type": "textV2", "text": " ".join(keys) + " " + REMIND_MENTION_TEXT, "substitution": subs}
+
+def push_followup_to_group(group_id, alt_text, contents, user_ids, need_all):
+    messages = [{"type": "flex", "altText": alt_text, "contents": contents},
+                build_followup_mention_message(user_ids, need_all)]
     resp = requests.post(
         LINE_PUSH_URL,
         headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
@@ -1187,7 +1447,7 @@ def push_followup_to_group(group_id, alt_text, contents):
     resp.raise_for_status()
 
 def send_reply_followup(force=False):
-    """Posts the follow-up to every group with unanswered documents. Returns a
+    """Posts the follow-up to every group with docs still waiting. Returns a
     short Thai status line. The scheduled run (force=False) sends at most once
     per day, so a restart around the scheduled minute can't double-post."""
     today = bkk_today().isoformat()
@@ -1196,16 +1456,25 @@ def send_reply_followup(force=False):
     by_group = get_unanswered_docs_by_group()
     if not by_group:
         set_setting("reply_followup_last_sent", today)
-        return "ทุกเอกสารมีคำตอบแล้ว ไม่ต้องส่งติดตามครับ 🎉"
-    sent, failed = [], []
+        return "ทุกเอกสารตอบครบแล้ว ไม่ต้องส่งติดตามครับ 🎉"
+    sent, failed, missing = [], [], []
     for group_id, docs in by_group.items():
         target = group_id or inspection_target_group_id()
         if not target:
             failed.append(f"{len(docs)} ฉบับ (ไม่รู้กลุ่มปลายทาง)")
             continue
+        user_ids, need_all = followup_tag_targets(docs)
+        present = []
+        for uid in user_ids:
+            if group_member_ok(target, uid):
+                present.append(uid)
+            else:
+                missing.append(uid)
+        if len(present) < len(user_ids):
+            need_all = True  # someone who should answer has left - make sure the group still hears it
         alt_text, contents = build_followup_flex(docs)
         try:
-            push_followup_to_group(target, alt_text, contents)
+            push_followup_to_group(target, alt_text, contents, present, need_all)
             sent.append(f'"{get_group_name(target)}" {len(docs)} ฉบับ')
         except Exception as e:
             app.logger.exception("follow-up push failed")
@@ -1217,21 +1486,34 @@ def send_reply_followup(force=False):
         lines.append("ส่งติดตามคำตอบเข้ากลุ่มแล้ว: " + ", ".join(sent))
     if failed:
         lines.append("ส่งไม่สำเร็จ: " + ", ".join(failed))
+    if missing:
+        teams = load_buddy_teams()
+        labels = sorted({t["label"] for t in teams for u in missing if u in t["members"]})
+        lines.append(f"⚠️ มีผู้รับผิดชอบ {len(missing)} คนไม่อยู่ในกลุ่มแล้ว (บัดดี้ {', '.join(labels)}) "
+                     "จึงแท็ก @All แทน — ตั้งคนใหม่ด้วย \"ตั้งบัดดี้\" ในกลุ่ม")
     return "\n".join(lines)
 
 def scheduled_reply_followup():
     try:
-        send_reply_followup()
+        result = send_reply_followup()
+        if "⚠️" in result or "ไม่สำเร็จ" in result:
+            push_to_owner(result)
     except Exception:
         app.logger.exception("scheduled reply follow-up failed")
 
 def build_followup_preview():
     by_group = get_unanswered_docs_by_group()
     if not by_group:
-        return ("ทุกเอกสารในช่วง %d วันล่าสุดมีคำตอบแล้วครับ 🎉" % REMIND_WINDOW_DAYS, None)
+        return ("ทุกเอกสารในช่วง %d วันล่าสุดตอบครบแล้วครับ 🎉" % REMIND_WINDOW_DAYS, None, "")
     docs = [d for group_docs in by_group.values() for d in group_docs]
-    docs.sort(key=lambda d: (d[3] or "", d[0]))
-    return build_followup_flex(docs)
+    docs.sort(key=lambda d: (d["posted_at"] or "", d["code"]))
+    alt_text, contents = build_followup_flex(docs)
+    user_ids, need_all = followup_tag_targets(docs)
+    group_for_names = next(iter(by_group)) or inspection_target_group_id()
+    who = [get_profile_name(group_for_names, u) for u in user_ids]
+    if need_all:
+        who.insert(0, "@All")
+    return (alt_text, contents, "จะแท็ก: " + (", ".join(who) if who else "@All"))
 
 # --- LIFF page + JSON API ---
 LINE_VERIFY_ID_TOKEN_URL = "https://api.line.me/oauth2/v2.1/verify"
@@ -1273,6 +1555,7 @@ def api_doc_replies(code):
         if not text:
             return {"error": "empty"}, 400
         add_doc_reply(code, user_id, user_name, text, "liff")
+        after_doc_reply(code, user_id, user_name, text)
     replies = [{"user_name": r["user_name"], "text": r["text"],
                 "time": _fmt_dt(r["created_at"]), "mine": r["user_id"] == user_id}
                for r in get_doc_replies(code)]
@@ -2254,7 +2537,7 @@ def send_daily_digest():
     except Exception:
         app.logger.exception("could not count unanswered docs")
         unanswered = 0
-    reply_note = (f'\n\n💬 เอกสารที่ยังไม่มีคำตอบ {unanswered} ฉบับ — พิมพ์ "คำตอบ" เพื่อดู'
+    reply_note = (f'\n\n💬 เอกสารที่ยังรอคำตอบ {unanswered} ฉบับ — พิมพ์ "คำตอบ" เพื่อดู'
                   if unanswered else "")
 
     report_url = daily_report_url()
