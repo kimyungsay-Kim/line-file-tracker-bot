@@ -771,9 +771,10 @@ def clear_inspection_preview(user_id):
 
 INSPECTION_LABEL_COLOR = "#90A4AE"
 INSPECTION_VALUE_COLOR = "#000000"       # Code / เรื่อง / วันที่ส่งเอกสารเข้าระบบ - plain black
-INSPECTION_DOCNUM_COLOR = "#1B5E20"      # เลขที่เอกสาร (เช่น AR-333) - bold, dark green
-INSPECTION_DOCNUM_BG_COLOR = "#A5D6A7"   # stronger green highlight behind it
-INSPECTION_DOCNUM_LABEL_COLOR = "#2E7D32"  # label inside the green badge
+INSPECTION_DOCNUM_COLOR = "#C2571A"      # เลขที่เอกสาร (เช่น AR-333) - bold, burnt orange
+INSPECTION_DOCNUM_BG_COLOR = "#FFF8E7"   # warm cream highlight behind it
+INSPECTION_DOCNUM_BORDER_COLOR = "#F5DDB5"  # soft beige outline
+INSPECTION_DOCNUM_LABEL_COLOR = "#7A2E12"  # label inside the badge - deep brown-red
 INSPECTION_EXTRA_NOTE_COLOR = "#EF6C00"  # วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ - kept colored
 INSPECTION_SEPARATOR_COLOR = "#0D47A1"   # divider line between documents - dark blue
 
@@ -806,10 +807,11 @@ def build_inspection_carousel_flex(items):
         instead of the plain field() layout, to stand out as the key value."""
         return {
             "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
-            "backgroundColor": INSPECTION_DOCNUM_BG_COLOR, "cornerRadius": "md", "paddingAll": "sm",
+            "backgroundColor": INSPECTION_DOCNUM_BG_COLOR, "cornerRadius": "md", "paddingAll": "md",
+            "borderWidth": "1px", "borderColor": INSPECTION_DOCNUM_BORDER_COLOR,
             "contents": [
                 txt("📌 เลขที่เอกสาร", size="xs", color=INSPECTION_DOCNUM_LABEL_COLOR, weight="bold"),
-                txt(value, size="xs", color=INSPECTION_DOCNUM_COLOR, wrap=True, weight="bold"),
+                txt(value, size="lg", color=INSPECTION_DOCNUM_COLOR, wrap=True, weight="bold"),
             ]
         }
 
