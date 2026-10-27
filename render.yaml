@@ -24,6 +24,12 @@ services:
         value: "8"
       - key: OVERDUE_MINUTE
         value: "0"
+      - key: REMIND_HOUR
+        value: "9"
+      - key: REMIND_MINUTE
+        value: "0"
+      - key: REMIND_DAYS_OF_WEEK
+        value: mon-sat
       - key: TAG_LOOKBACK_MINUTES
         value: "30"
       - key: TURSO_DATABASE_URL
