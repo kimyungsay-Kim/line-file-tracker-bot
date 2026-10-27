@@ -512,6 +512,11 @@ def handle_text(event):
                       'AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026')
             return
 
+        manual_answer = handle_manual_answer(user_id, text)
+        if manual_answer is not None:
+            reply(event.reply_token, manual_answer)
+            return
+
         if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
             # shared summary: everyone tracked sees the same tagged events,
             # regardless of who specifically got tagged
@@ -1197,9 +1202,14 @@ def doc_team_status(code, subject, teams, replier_ids):
         else:
             label = f"{system} ({'/'.join(t['building'] or t['label'] for t in need)})"
         members = [u for t in need for u in t["members"]]
-        done = bool(set(members) & replier_ids)
-        out.append({"label": label, "done": done, "tag_ids": [] if done else members})
+        done = bool(set(members) & replier_ids) or any(team_marker(t["label"]) in replier_ids for t in need)
+        out.append({"label": label, "done": done, "tag_ids": [] if done else members,
+                    "teams": [t["label"] for t in need]})
     return out
+
+def team_marker(label):
+    """user_id stored on a reply the owner records for a whole team."""
+    return f"team:{label}"
 
 def get_docs_status(days):
     """Every doc posted in the last `days` days with its reply state, oldest first."""
@@ -1334,6 +1344,100 @@ def group_member_ok(group_id, user_id):
         return resp.status_code != 404
     except Exception:
         return True  # can't tell - try the mention anyway
+
+# --- Teams that answer the owner privately (e.g. AC) ---
+# The owner (or a tracked admin) records it in the 1:1 chat:
+#     ตอบแล้ว AR-325 RIH-I02330      (team defaults to MANUAL_ANSWER_DEFAULT_TEAM)
+#     AC ตอบแล้ว AR-325              (or name the team)
+#     AC ตอบครบแล้ว                  (every doc still waiting on that team)
+#     AC ยกเลิกตอบแล้ว AR-325        (undo)
+# Saved as a reply from "team:<label>", which counts for that team.
+MANUAL_ANSWER_DEFAULT_TEAM = os.environ.get("MANUAL_ANSWER_DEFAULT_TEAM", "AC").strip().upper()
+MANUAL_ANSWER_RE = re.compile(r"^(?:(\S+)\s+)?(ยกเลิกตอบแล้ว|ตอบครบแล้ว|ตอบแล้ว)(?:\s+(.*))?$", re.DOTALL)
+
+def find_doc_code(ref):
+    """Doc short code ("AR-325") from a code or a document number
+    ("RIH-I02330", or just its tail like "I02330" / "02330")."""
+    code = normalize_doc_code(ref)
+    if code and get_inspection_doc(code):
+        return code
+    ref_u = (ref or "").strip().upper()
+    if len(ref_u) < 4:
+        return None
+    conn = db()
+    try:
+        rows = conn.execute("SELECT code, doc_number FROM inspection_docs").fetchall()
+    finally:
+        conn.close()
+    exact = [c for c, n in rows if (n or "").strip().upper() == ref_u]
+    if exact:
+        return exact[0]
+    tail = [c for c, n in rows if (n or "").strip().upper().endswith(ref_u)]
+    return tail[0] if len(tail) == 1 else None
+
+def handle_manual_answer(user_id, text):
+    """Returns a reply string, or None if the text isn't this command."""
+    m = MANUAL_ANSWER_RE.match(text)
+    if not m:
+        return None
+    allowed = ({OWNER_USER_ID} if OWNER_USER_ID else set()) | set(TAGGED_USER_IDS)
+    if allowed and user_id not in allowed:
+        return None
+    label = (m.group(1) or MANUAL_ANSWER_DEFAULT_TEAM).upper()
+    action, rest = m.group(2), (m.group(3) or "").strip()
+    teams = {t["label"]: t for t in load_buddy_teams()}
+    team = teams.get(label)
+    if not team:
+        return (f"ไม่พบบัดดี้ชื่อ {label} ครับ ตั้งในกลุ่มก่อนด้วย "
+                f"\"ตั้งบัดดี้ AR,ST {label} @ชื่อ1 @ชื่อ2\"")
+    marker = team_marker(label)
+
+    if action == "ตอบครบแล้ว":
+        targets = [d["code"] for d in get_docs_status(REMIND_WINDOW_DAYS)
+                   if d["pending"] and d["status"]
+                   and any(label in s["teams"] and not s["done"] for s in d["status"])]
+        if not targets:
+            return f"ไม่มีเอกสารที่ยังรอทีม {label} ตอบครับ"
+        for code in targets:
+            add_doc_reply(code, marker, f"ทีม {label} (แจ้งผ่านแอดมิน)", "ตอบแล้ว (ตอบส่วนตัวกับแอดมิน)", "owner")
+        return f"✅ บันทึกว่าทีม {label} ตอบครบแล้ว {len(targets)} ฉบับ: {', '.join(targets)}"
+
+    refs = [r for r in re.split(r"[\s,]+", rest) if r]
+    if not refs:
+        return (f"ใส่รหัสหรือเลขที่เอกสารด้วยครับ เช่น \"{action} AR-325 RIH-I02330\" "
+                f"หรือ \"{label} ตอบครบแล้ว\"")
+    ok, skipped, unknown = [], [], []
+    conn = None
+    for ref in refs:
+        code = find_doc_code(ref)
+        if not code:
+            unknown.append(ref)
+            continue
+        if doc_prefix(code) not in team["prefixes"]:
+            skipped.append(code)
+            continue
+        existing = [r for r in get_doc_replies(code) if r["user_id"] == marker]
+        if action == "ยกเลิกตอบแล้ว":
+            conn = db()
+            try:
+                conn.execute("DELETE FROM doc_replies WHERE code = ? AND user_id = ?", (code, marker))
+            finally:
+                conn.close()
+            ok.append(code)
+        elif existing:
+            ok.append(code)  # already recorded - nothing to add
+        else:
+            add_doc_reply(code, marker, f"ทีม {label} (แจ้งผ่านแอดมิน)", "ตอบแล้ว (ตอบส่วนตัวกับแอดมิน)", "owner")
+            ok.append(code)
+    lines = []
+    if ok:
+        lines.append(("↩️ ยกเลิกสถานะตอบแล้วของทีม " if action == "ยกเลิกตอบแล้ว" else "✅ บันทึกว่าทีม ")
+                     + f"{label}{'' if action == 'ยกเลิกตอบแล้ว' else ' ตอบแล้ว'}: {', '.join(ok)}")
+    if skipped:
+        lines.append(f"ข้าม (ทีม {label} ไม่ได้รับผิดชอบหมวดนี้): {', '.join(skipped)}")
+    if unknown:
+        lines.append(f"ไม่พบเอกสาร: {', '.join(unknown)}")
+    return "\n".join(lines)
 
 # --- Daily follow-up in the group: documents still waiting for a reply ---
 # Every working day the bot posts, into the group each document was posted to,
