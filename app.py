@@ -336,6 +336,30 @@ def find_group_member_by_name(group_id, name):
             return None
     return None
 
+
+def load_member_name_map():
+    """normalized display name -> user_id, only for names that point to one person."""
+    conn = db()
+    try:
+        rows = conn.execute("SELECT user_id, display_name FROM group_members").fetchall()
+    finally:
+        conn.close()
+    ids = {}
+    for uid, dn in rows:
+        ids.setdefault(_norm_name(dn), set()).add(uid)
+    return {n: next(iter(u)) for n, u in ids.items() if n and len(u) == 1}
+
+def reply_identity_ids(user_id, user_name, name_map):
+    """IDs a reply should count for. A reply sent from the LIFF "ตอบกลับ" page
+    carries the LINE Login channel's user ID, which can differ from the ID the
+    same person has in the group (different provider) - so the reply also
+    counts for the group member with the same display name."""
+    out = {user_id} if user_id else set()
+    alt = name_map.get(_norm_name(user_name))
+    if alt:
+        out.add(alt)
+    return out
+
 def get_setting(key, default=""):
     try:
         conn = db()
@@ -1305,9 +1329,14 @@ def get_docs_status(days):
     finally:
         conn.close()
     by_code = {}
+    try:
+        name_map = load_member_name_map()
+    except Exception:
+        app.logger.exception("load member names failed")
+        name_map = {}
     for code, uid, name, text in replies:
         info = by_code.setdefault(code, {"ids": set(), "n": 0, "latest": None})
-        info["ids"].add(uid)
+        info["ids"] |= reply_identity_ids(uid, name, name_map)
         info["n"] += 1
         info["latest"] = f"{name}: {text}"
     teams = load_buddy_teams()
@@ -1353,7 +1382,8 @@ def notify_owner_outsider_reply(code, user_id, user_name, text):
     if not doc:
         return
     applicable = [t for t in load_buddy_teams() if doc_prefix(code) in t["prefixes"]]
-    if not applicable or any(user_id in t["members"] for t in applicable):
+    ids = reply_identity_ids(user_id, user_name, load_member_name_map())
+    if not applicable or any(ids & set(t["members"]) for t in applicable):
         return
     preview = text if len(text) <= 300 else text[:300] + "…"
     push_to_owner(
