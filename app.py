@@ -591,6 +591,10 @@ def handle_text(event):
                 reply(event.reply_token, "ยกเลิกรายการที่รอส่งแล้วครับ")
             return
 
+        if text.startswith(TRACK_BACKFILL_CMD):
+            reply(event.reply_token, handle_track_backfill(text))
+            return
+
         if "|" in text:
             parsed_items = parse_inspection_paste(text)
             if parsed_items:
@@ -1080,6 +1084,103 @@ def save_inspection_docs(items, group_id):
     finally:
         conn.close()
 
+# --- Add earlier documents to the reply follow-up (1:1, nothing posted) ---
+#   ติดตามย้อนหลัง AR-337 ST-802 ...            codes already posted by the bot
+#   ติดตามย้อนหลัง 27/10/2026                    first line (date optional = when
+#   AR-337|RIH-I02351|เรื่อง|24/10/2026          they were posted to the group),
+#   ...                                          then the usual pipe lines
+# Existing docs keep their original posted date (so "รอ X วัน" stays right) and
+# are reopened if closed; unknown ones are inserted with the given date (or now).
+TRACK_BACKFILL_CMD = "ติดตามย้อนหลัง"
+
+def _parse_thai_or_iso_date(raw):
+    raw = (raw or "").strip()
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
+        try:
+            d = datetime.datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+        if d.year > 2400:  # Buddhist year
+            d = d.replace(year=d.year - 543)
+        return d
+    return None
+
+def handle_track_backfill(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    head = lines[0][len(TRACK_BACKFILL_CMD):].strip()
+    body = lines[1:]
+    posted_date = None
+    head_refs = []
+    for tok in re.split(r"[\s,]+", head):
+        if not tok:
+            continue
+        d = _parse_thai_or_iso_date(tok)
+        if d:
+            posted_date = d
+        else:
+            head_refs.append(tok)
+    pipe_items = parse_inspection_paste("\n".join(body)) if body else None
+    if body and pipe_items is None:
+        head_refs += [r for ln in body for r in re.split(r"[\s,]+", ln) if r]
+    if not head_refs and not pipe_items:
+        return (f'วิธีใช้:\n{TRACK_BACKFILL_CMD} AR-337 ST-802\n'
+                f'หรือ (กรณีบอทไม่มีข้อมูลเอกสาร)\n{TRACK_BACKFILL_CMD} 27/10/2026\n'
+                'AR-337|RIH-I02351|เรื่อง|24/10/2026\n...\n'
+                '(วันที่บรรทัดแรก = วันที่เคยโพสต์เข้ากลุ่ม ไม่ใส่ก็ได้)')
+    if posted_date:
+        posted_iso = datetime.datetime.combine(posted_date, datetime.time(17, 0)).isoformat()
+    else:
+        posted_iso = bkk_now().isoformat()
+    group_id = inspection_target_group_id() or ""
+    added, reopened, kept, unknown = [], [], [], []
+    conn = db()
+    try:
+        for it in (pipe_items or []):
+            code = normalize_doc_code(it["code"]) or it["code"].strip().upper()
+            row = conn.execute("SELECT closed_at FROM inspection_docs WHERE code = ?", (code,)).fetchone()
+            if row:
+                conn.execute("UPDATE inspection_docs SET closed_at = NULL WHERE code = ?", (code,))
+                (reopened if row[0] else kept).append(code)
+            else:
+                conn.execute(
+                    "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (code, it["doc_number"], it["subject"], it["date"], it.get("extra_note", ""),
+                     group_id, posted_iso))
+                added.append(code)
+        for ref in head_refs:
+            code = normalize_doc_code(ref)
+            row = conn.execute("SELECT closed_at FROM inspection_docs WHERE code = ?",
+                               (code,)).fetchone() if code else None
+            if not row:
+                unknown.append(ref)
+                continue
+            conn.execute("UPDATE inspection_docs SET closed_at = NULL WHERE code = ?", (code,))
+            (reopened if row[0] else kept).append(code)
+        if posted_date:
+            # an explicit date also corrects docs whose posted date was lost or reset
+            for code in kept + reopened:
+                conn.execute("UPDATE inspection_docs SET posted_at = ? WHERE code = ?", (posted_iso, code))
+    finally:
+        conn.close()
+    touched = set(added + reopened + kept)
+    status = {d["code"]: d for d in get_docs_status(REMIND_WINDOW_DAYS) if d["code"] in touched}
+    out = [f"📌 เพิ่มเข้ารายการติดตามแล้ว {len(touched)} ฉบับ (ไม่ได้โพสต์เข้ากลุ่ม)"]
+    for code in sorted(touched, key=lambda c: (doc_prefix(c), int(c.split("-")[1]) if c.split("-")[1].isdigit() else 0)):
+        d = status.get(code)
+        tag = " (ใหม่)" if code in added else (" (เปิดคืน)" if code in reopened else "")
+        if not d:
+            out.append(f"• {code}{tag} — เก่าเกิน {REMIND_WINDOW_DAYS} วัน จะไม่ขึ้นในรายการติดตาม")
+        elif d["pending"]:
+            out.append(f"• {code}{tag} — 🟠 รอตอบ: " + (team_status_line(d["status"]) if d["status"] else "ยังไม่มีคนตอบ"))
+        else:
+            out.append(f"• {code}{tag} — ✅ ตอบครบแล้ว" + (f" ({team_status_line(d['status'])})" if d["status"] else ""))
+    if unknown:
+        out.append(f"\n❓ ไม่พบในระบบบอท: {', '.join(unknown)}\n"
+                   f"ให้ส่งแบบมีรายละเอียดแทน:\n{TRACK_BACKFILL_CMD} <วันที่โพสต์>\ncode|เลขที่เอกสาร|เรื่อง|วันที่")
+    out.append('\nดูตัวอย่างข้อความติดตาม: พิมพ์ "ติดตาม"')
+    return "\n".join(out)
+
 def get_inspection_doc(code):
     conn = db()
     try:
@@ -1280,12 +1381,31 @@ def delete_buddy_team(label):
         conn.close()
     return bool(found)
 
+# Systems every doc of a prefix must be answered by, even if that system's
+# buddy team hasn't been set up yet - otherwise one team's reply would make
+# the doc look fully answered and it would drop out of the follow-up.
+# Format: "AR,ST=EE,AC,SN/FP;XX=EE"
+def _parse_required_systems(raw):
+    out = {}
+    for part in (raw or "").split(";"):
+        if "=" not in part:
+            continue
+        prefixes, systems = part.split("=", 1)
+        sys_list = [x.strip().upper() for x in systems.split(",") if x.strip()]
+        for pre in prefixes.split(","):
+            if pre.strip():
+                out[pre.strip().upper()] = sys_list
+    return out
+
+REQUIRED_SYSTEMS = _parse_required_systems(os.environ.get("REQUIRED_SYSTEMS", "AR,ST=EE,AC,SN/FP"))
+
 def doc_team_status(code, subject, teams, replier_ids):
     """[{label, done, tag_ids}] per system this doc needs, or None when no
     team covers the doc's prefix (old rule: any reply answers it)."""
     prefix = doc_prefix(code)
     applicable = [t for t in teams if prefix in t["prefixes"]]
-    if not applicable:
+    required = REQUIRED_SYSTEMS.get(prefix, [])
+    if not applicable and not required:
         return None
     systems = []
     for t in applicable:
@@ -1308,6 +1428,11 @@ def doc_team_status(code, subject, teams, replier_ids):
         done = bool(set(members) & replier_ids) or any(team_marker(t["label"]) in replier_ids for t in need)
         out.append({"label": label, "done": done, "tag_ids": [] if done else members,
                     "teams": [t["label"] for t in need]})
+    for system in required:
+        if system not in systems:
+            # no buddy team yet: can only be cleared by "ปิดเอกสาร" or by setting the team
+            out.append({"label": f"{system} (ยังไม่ตั้งบัดดี้)", "done": False, "tag_ids": [],
+                        "teams": [], "missing": True})
     return out
 
 def team_marker(label):
@@ -1622,6 +1747,8 @@ def followup_tag_targets(docs):
         if d["status"] is None:
             need_all = True
             continue
+        if any(s.get("missing") for s in d["status"]):
+            need_all = True  # a system with no buddy team - nobody specific to tag
         for s in d["status"]:
             for u in s["tag_ids"]:
                 if u not in ids:
