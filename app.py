@@ -1126,13 +1126,13 @@ def count_unanswered_docs():
 # A document whose code prefix (AR, ST, ...) has teams needs an answer from
 # every SYSTEM; within a team one member's reply counts for the whole team.
 # Teams named "<system>-<building>" (EE-A, EE-B) split one system by building:
-# the subject is searched for "อาคาร A"/"ตึก B"/...; one building found ->
+# the subject is searched for "อาคาร A"/"ตึก B"/"Tower B"/...; one building found ->
 # only that team counts, none or both found -> either team's reply counts.
 # A reply from someone outside the doc's teams (and not the owner) is kept
 # but doesn't count; the owner gets a 1:1 heads-up and may close the doc
 # with "ปิดเอกสาร <code>". Prefixes with no team keep the old rule (any reply).
 BUILDING_RE = re.compile(
-    r"(?:อาคาร|ตึก|building|bldg\.?|bld\.?|zone|โซน)\s*[-:.]?\s*([AB])(?![A-Za-z])", re.IGNORECASE)
+    r"(?:อาคาร|ตึก|tower|building|bldg\.?|bld\.?|zone|โซน)\s*[-:.]?\s*([AB])(?![A-Za-z])", re.IGNORECASE)
 TEAM_SPLIT_RE = re.compile(r"^(.+)-([A-Z0-9])$")
 
 def detect_buildings(subject):
@@ -1292,41 +1292,58 @@ def after_doc_reply(code, user_id, user_name, text):
         app.logger.exception("outsider reply notice failed")
 
 def handle_set_buddy_command(event, group_id, text):
-    """Group: "ตั้งบัดดี้ AR,ST EE-A @a @b" (owner only, confirmation goes 1:1)."""
+    """Group: "ตั้งบัดดี้ AR,ST EE-A @a @b" (owner only, confirmation goes 1:1).
+    Several teams can be set in one message, one "ตั้งบัดดี้ ..." per line;
+    each line only gets the @mentions written on that line."""
     sender_id = event.source.user_id
     allowed = {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
     if sender_id not in allowed:
         return
     mention = getattr(event.message, "mention", None)
     mentionees = list(mention.mentionees) if mention and mention.mentionees else []
-    # strip the @name parts (LINE gives UTF-16 offsets) to read prefixes + label
-    plain, cut = text, []
+    spans = []  # (py_start, py_end, mentionee)
     for m in mentionees:
         if getattr(m, "index", None) is not None and getattr(m, "length", None) is not None:
-            cut.append((utf16_index_to_py(text, m.index), utf16_index_to_py(text, m.index + m.length)))
-    for start, end in sorted(cut, reverse=True):
-        plain = plain[:start] + " " + plain[end:]
-    tokens = plain.split()
+            spans.append((utf16_index_to_py(text, m.index),
+                          utf16_index_to_py(text, m.index + m.length), m))
     usage = ('รูปแบบ: ตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
-             '(เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา ห้ามพิมพ์ @ชื่อ เอง)')
-    if len(tokens) < 3:
+             '(ตั้งหลายทีมในข้อความเดียวได้ บรรทัดละ 1 ทีม · เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา ห้ามพิมพ์ @ชื่อ เอง)')
+    results, pos = [], 0
+    for line in text.split("\n"):
+        line_start, line_end = pos, pos + len(line)
+        pos = line_end + 1
+        if not line.strip().startswith("ตั้งบัดดี้"):
+            continue
+        own = [(a, b, m) for a, b, m in spans if line_start <= a < line_end]
+        plain = line
+        for a, b, _ in sorted(own, key=lambda x: x[0], reverse=True):
+            plain = plain[:a - line_start] + " " + plain[b - line_start:]
+        tokens = plain.split()
+        if len(tokens) < 3:
+            results.append(f"❌ \"{line.strip()}\" ข้อมูลไม่ครบ")
+            continue
+        prefixes = {p.strip().upper() for p in tokens[1].split(",") if p.strip()}
+        label = tokens[2].upper()
+        if not prefixes or not all(re.fullmatch(r"[A-Z]{1,5}", p) for p in prefixes):
+            results.append(f'❌ {label}: รหัสหมวด "{tokens[1]}" ไม่ถูกต้อง')
+            continue
+        users = [m for _, _, m in own if getattr(m, "type", "user") == "user"]
+        members = [m.user_id for m in users if getattr(m, "user_id", None)]
+        if not members or len(members) < len(users):
+            results.append(f"❌ {label}: บอทไม่ได้รับรหัสของบางคน (ให้คนนั้นเพิ่มบอทเป็นเพื่อน แล้วตั้งใหม่)")
+            continue
+        members = list(dict.fromkeys(members))
+        save_buddy_team(label, prefixes, members, group_id)
+        names = ", ".join(get_profile_name(group_id, u) for u in members)
+        results.append(f"✅ {label} (เอกสาร {', '.join(sorted(prefixes))}): {names}")
+    if not results:
         push_to(sender_id, "ตั้งบัดดี้ไม่สำเร็จ ข้อมูลไม่ครบครับ\n" + usage)
         return
-    prefixes = {p.strip().upper() for p in tokens[1].split(",") if p.strip()}
-    label = tokens[2].upper()
-    members = [m.user_id for m in mentionees
-               if getattr(m, "type", "user") == "user" and getattr(m, "user_id", None)]
-    if not prefixes or not all(re.fullmatch(r"[A-Z]{1,5}", p) for p in prefixes):
-        push_to(sender_id, f'ตั้งบัดดี้ไม่สำเร็จ รหัสหมวด "{tokens[1]}" ไม่ถูกต้องครับ\n' + usage)
-        return
-    if not members or len(members) < len([m for m in mentionees if getattr(m, "type", "user") == "user"]):
-        push_to(sender_id, "ตั้งบัดดี้ไม่สำเร็จ บอทไม่ได้รับรหัสของบางคนครับ\n" + usage)
-        return
-    members = list(dict.fromkeys(members))
-    save_buddy_team(label, prefixes, members, group_id)
-    names = ", ".join(get_profile_name(group_id, u) for u in members)
-    push_to(sender_id, f"✅ ตั้งบัดดี้ {label} (เอกสาร {', '.join(sorted(prefixes))}) แล้วครับ: {names}\n"
-                       "กดยกเลิกข้อความคำสั่งในกลุ่มได้เลย · ดูทั้งหมดพิมพ์ \"บัดดี้\" ในแชทนี้")
+    msg = "ผลการตั้งบัดดี้\n" + "\n".join(results)
+    if any(r.startswith("❌") for r in results):
+        msg += "\n\n" + usage
+    msg += '\n\nกดยกเลิกข้อความคำสั่งในกลุ่มได้เลย · ดูทั้งหมดพิมพ์ "บัดดี้" ในแชทนี้'
+    push_to(sender_id, msg)
 
 def build_buddy_list_text():
     teams = load_buddy_teams()
