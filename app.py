@@ -3,6 +3,8 @@ import io
 import csv
 import json
 import datetime
+import re
+import time
 import unicodedata
 from zoneinfo import ZoneInfo
 
@@ -176,6 +178,17 @@ SCHEMA_STATEMENTS = [
         updated_at TEXT
     )
     """,
+    # everyone the bot has seen talk in a group: lets "ตั้งบัดดี้" resolve an
+    # @mention to a user ID even when that person never added the bot as a friend
+    """
+    CREATE TABLE IF NOT EXISTS group_members (
+        group_id TEXT,
+        user_id TEXT,
+        display_name TEXT,
+        seen_at TEXT,
+        PRIMARY KEY (group_id, user_id)
+    )
+    """,
     # replies typed by the team about a posted document - many per document
     """
     CREATE TABLE IF NOT EXISTS doc_replies (
@@ -262,6 +275,66 @@ def get_group_name(group_id):
             return summary.group_name
     except Exception:
         return group_id
+
+
+# --- Group member directory (no friendship needed) ---
+# LINE puts the sender's user ID on every group message even if they never
+# added the bot, but only puts a user ID on an @mention when the mentioned
+# person has. So we remember each sender's ID + current display name, and
+# "ตั้งบัดดี้" falls back to matching an @name against this list.
+_member_refreshed = {}
+MEMBER_REFRESH_SECONDS = 6 * 3600
+
+def _norm_name(name):
+    return re.sub(r"\s+", " ", (name or "").strip().lstrip("@").strip()).casefold()
+
+def save_group_member(group_id, user_id, display_name):
+    if not (group_id and user_id and display_name):
+        return
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id, display_name, seen_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(group_id, user_id) DO UPDATE SET display_name = excluded.display_name, "
+            "seen_at = excluded.seen_at",
+            (group_id, user_id, display_name, bkk_now().isoformat()))
+    finally:
+        conn.close()
+
+def remember_group_member(group_id, user_id, display_name=None):
+    """Record a group message sender (name looked up at most every few hours)."""
+    if not (group_id and user_id):
+        return
+    key = (group_id, user_id)
+    now = time.time()
+    if display_name is None and now - _member_refreshed.get(key, 0) < MEMBER_REFRESH_SECONDS:
+        return
+    try:
+        name = display_name or get_profile_name(group_id, user_id)
+        if name and name != "ไม่ทราบชื่อ":
+            save_group_member(group_id, user_id, name)
+            _member_refreshed[key] = now
+    except Exception:
+        app.logger.exception("remember group member failed")
+
+def find_group_member_by_name(group_id, name):
+    """user_id whose display name matches @name: this group first, then any
+    group. None when unknown or ambiguous."""
+    target = _norm_name(name)
+    if not target:
+        return None
+    conn = db()
+    try:
+        rows = conn.execute("SELECT group_id, user_id, display_name FROM group_members").fetchall()
+    finally:
+        conn.close()
+    for scope in ([r for r in rows if r[0] == group_id], rows):
+        ids = {uid for _, uid, dn in scope if _norm_name(dn) == target}
+        if len(ids) == 1:
+            return ids.pop()
+        if len(ids) > 1:
+            return None
+    return None
 
 def get_setting(key, default=""):
     try:
@@ -441,6 +514,7 @@ def handle_file(event):
 
     sender_id = source.user_id
     sender_name = get_profile_name(group_id, sender_id)
+    remember_group_member(group_id, sender_id, sender_name)
     group_name = get_group_name(group_id)
     msg = event.message
     file_name = getattr(msg, "file_name", None) or msg.type
@@ -574,6 +648,7 @@ def handle_text(event):
         return
 
     group_id = source.group_id
+    remember_group_member(group_id, source.user_id)
 
     # utility: anyone can type "groupid" in a group to get its ID for setup
     if text.lower() in ("groupid", "ไอดีกลุ่ม"):
@@ -941,6 +1016,7 @@ def handle_wrong_group_notice():
 # the LIFF page opened from the card's "💬 ตอบกลับเอกสารนี้" link. Nothing is
 # pushed when a reply arrives; the owner checks with the 1:1 "คำตอบ" command.
 import re
+import time
 
 REPLY_LINK_COLOR = "#1565C0"
 REPLY_MAX_LEN = 1000
@@ -1307,7 +1383,7 @@ def handle_set_buddy_command(event, group_id, text):
             spans.append((utf16_index_to_py(text, m.index),
                           utf16_index_to_py(text, m.index + m.length), m))
     usage = ('รูปแบบ: ตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
-             '(ตั้งหลายทีมในข้อความเดียวได้ บรรทัดละ 1 ทีม · เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา ห้ามพิมพ์ @ชื่อ เอง)')
+             '(ตั้งหลายทีมในข้อความเดียวได้ บรรทัดละ 1 ทีม · เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา)')
     results, pos = [], 0
     for line in text.split("\n"):
         line_start, line_end = pos, pos + len(line)
@@ -1327,10 +1403,22 @@ def handle_set_buddy_command(event, group_id, text):
         if not prefixes or not all(re.fullmatch(r"[A-Z]{1,5}", p) for p in prefixes):
             results.append(f'❌ {label}: รหัสหมวด "{tokens[1]}" ไม่ถูกต้อง')
             continue
-        users = [m for _, _, m in own if getattr(m, "type", "user") == "user"]
-        members = [m.user_id for m in users if getattr(m, "user_id", None)]
-        if not members or len(members) < len(users):
-            results.append(f"❌ {label}: บอทไม่ได้รับรหัสของบางคน (ให้คนนั้นเพิ่มบอทเป็นเพื่อน แล้วตั้งใหม่)")
+        members, unknown = [], []
+        for a, b, m in own:
+            if getattr(m, "type", "user") != "user":
+                continue
+            uid = getattr(m, "user_id", None)
+            if not uid:  # not a friend of the bot: match the @name to someone seen in the group
+                uid = find_group_member_by_name(group_id, text[a:b])
+            if uid:
+                members.append(uid)
+            else:
+                unknown.append(text[a:b].strip())
+        if unknown or not members:
+            who = " ".join(unknown) or "(ไม่มีชื่อที่ @)"
+            results.append(f"❌ {label}: บอทยังไม่รู้จัก {who}\n"
+                           "   → ให้คนนั้นพิมพ์ข้อความอะไรก็ได้ในกลุ่มนี้ 1 ครั้ง แล้วส่งคำสั่งตั้งบัดดี้ใหม่ "
+                           "(ไม่ต้องแอดบอทเป็นเพื่อน)")
             continue
         members = list(dict.fromkeys(members))
         save_buddy_team(label, prefixes, members, group_id)
