@@ -513,9 +513,11 @@ def reply_inspection_preview(reply_token, items):
         lead_alt, lead = build_inspection_announce_flex(
             len(group), peek_batch_code(role), role, items_source_label(group))
         sets.append((lead_alt, lead, alt_text, bubbles))
-    trailing = 'ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
+    trailing = ('ถ้าข้อมูลถูกต้อง ไปที่กลุ่มแล้วพิมพ์ "แจ้ง" (ฟรี ไม่นับโควตา แล้วลบข้อความ "แจ้ง" ของตัวเองทิ้งได้)\n'
+                'หรือพิมพ์ "ส่ง" ที่นี่ (ใช้โควตา Push) · "ยกเลิก" เพื่อยกเลิกครับ')
     if len(sets) > 1:
-        trailing = "ตอนส่งจะโพสต์ 2 ชุดแยกกัน (Inspector ก่อน แล้วตามด้วยรับมอบพื้นที่)\n" + trailing
+        trailing = ("มี 2 ชุด (Inspector ก่อน แล้วตามด้วยรับมอบพื้นที่) ถ้ารายการยาวจนใส่ข้อความเดียวไม่พอ "
+                    'ให้พิมพ์ "แจ้ง" ซ้ำอีกครั้งเพื่อโพสต์ชุดที่เหลือ\n' + trailing)
     if any(role == ROLE_ASSIGNEE for role, _ in split_items_by_role(items)) and not get_assignee_co():
         trailing += '\n⚠️ ยังไม่ได้ตั้ง CO ชุดรับมอบพื้นที่จะแท็ก @All แทน — ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ"'
     total = sum(1 + len(b) for _, _, _, b in sets) + 1
@@ -539,44 +541,8 @@ INSPECTION_FILES_URL = os.environ.get(
     "https://firsttechno.storage-readyidc.com/index.php/s/WpypEPtTLXxMkt5",
 )
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ",
-                              batch_code=None, doc_codes=None, mention_user_id=None, include_files_link=True):
-    """Pushes a lead announcement Flex (so part of its text can be colored),
-    then the documents Flex, then an '@All'-mention text message, to the
-    given group. mention_user_id tags just that one person instead (e.g. the
-    CO for Assignee lists). Uses a raw HTTP call instead of the messaging
-    SDK's typed message classes because the installed line-bot-sdk version
-    here doesn't expose LINE's textV2/mention payload - this builds that
-    payload directly, per LINE's documented format."""
-    bubbles = flex_contents if isinstance(flex_contents, list) else [flex_contents]
-    messages = [
-        {"type": "flex", "altText": lead_alt_text, "contents": lead_contents},
-        *[{"type": "flex", "altText": flex_alt_text, "contents": b} for b in bubbles],
-        {
-            "type": "textV2",
-            # the round code + doc codes go in this plain-text message on purpose:
-            # LINE's in-chat search only finds text messages, never Flex cards
-            "text": (f"🔖 {batch_code} · {', '.join(doc_codes or [])}\n" if batch_code else "")
-                    + f"{{user1}} {mention_text}"
-                    + (f"\n{INSPECTION_FILES_URL}"
-                       if INSPECTION_FILES_URL and include_files_link else ""),
-            "substitution": {"user1": {"type": "mention", "mentionee": (
-                {"type": "user", "userId": mention_user_id} if mention_user_id else {"type": "all"})}},
-        },
-    ]
-    resp = requests.post(
-        LINE_PUSH_URL,
-        headers={
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"to": group_id, "messages": messages},
-        timeout=15,
-    )
-    app.logger.warning("inspection push to %s -> HTTP %s %s (request-id %s)",
-                       group_id, resp.status_code, resp.text[:300],
-                       resp.headers.get("X-Line-Request-Id"))
-    resp.raise_for_status()
+GROUP_ANNOUNCE_CMDS = ("แจ้ง", "แจ้งเอกสาร", "ส่ง")
+GROUP_FOLLOWUP_CMDS = ("ติดตาม", "ติดตามคำตอบ")
 
 # ---------- Webhook ----------
 @app.route("/callback", methods=["POST"])
@@ -708,7 +674,7 @@ def handle_text(event):
             else:
                 reply_flex_and_text(event.reply_token, alt_text, contents,
                                     f'{who}\n\nตัวอย่างข้อความติดตามที่จะส่งเข้ากลุ่มอัตโนมัติ {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น. '
-                                    f'({REMIND_DAYS_OF_WEEK}) — ถ้าต้องการส่งตอนนี้เลย พิมพ์ "ส่งติดตาม" ครับ' + '\nบันทึกว่าตอบแล้ว/ปิดบางรายการ: พิมพ์ "คำสั่งติดตาม"')
+                                    f'({REMIND_DAYS_OF_WEEK}) — ส่งตอนนี้: พิมพ์ "ติดตาม" ในกลุ่ม (ฟรี) หรือ "ส่งติดตาม" ที่นี่ (ใช้โควตา Push) ครับ' + '\nบันทึกว่าตอบแล้ว/ปิดบางรายการ: พิมพ์ "คำสั่งติดตาม"')
         elif text in ("บัดดี้", "ผู้รับผิดชอบ"):
             reply(event.reply_token, build_buddy_list_text())
         elif text.startswith("ลบบัดดี้ "):
@@ -769,6 +735,22 @@ def handle_text(event):
                 push_to(sender_id, "ตั้งค่ากลุ่มไม่สำเร็จค่ะ ลองใหม่อีกครั้ง")
             except Exception:
                 app.logger.exception("could not notify owner")
+        return
+
+    # owner-only, free Reply posting (no monthly Push quota):
+    #   "แจ้ง"    -> post the owner's waiting document list into this group
+    #   "ติดตาม"  -> post the reply follow-up for docs of this group
+    if text in GROUP_ANNOUNCE_CMDS and source.user_id in owner_ids():
+        try:
+            handle_group_announce(event, group_id)
+        except Exception:
+            app.logger.exception("group announce failed")
+        return
+    if text in GROUP_FOLLOWUP_CMDS and source.user_id in owner_ids():
+        try:
+            handle_group_followup(event, group_id)
+        except Exception:
+            app.logger.exception("group follow-up failed")
         return
 
     # set the CO tagged on Assignee (area handover) lists (owner only, reply 1:1)
@@ -1204,75 +1186,157 @@ def build_inspection_carousel_flex(items, role=ROLE_INSPECTOR):
                 else f"เอกสารตรวจสอบ {len(items)} รายการ")
     return alt_text, bubbles
 
+INSPECTOR_MENTION_TEXT = "โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ"
+ASSIGNEE_MENTION_TEXT = os.environ.get(
+    "ASSIGNEE_MENTION_TEXT",
+    "เพื่อดำเนินการแนบรูปเข้าระบบ Site around และปิดจบเอกสารในระบบค่ะ",
+)
+LINE_MAX_MESSAGES = 5  # per push / reply request
+LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+QUOTA_HINT = ('💡 โควตา Push ของ LINE OA เดือนนี้เต็มแล้ว — ไปที่กลุ่มแล้วพิมพ์ "แจ้ง" '
+              'บอทจะโพสต์ด้วย Reply แทน (ฟรี ไม่นับโควตา) รายการยังรออยู่ครับ')
+
+def _role_label(role):
+    return "รับมอบพื้นที่ (Assignee)" if role == ROLE_ASSIGNEE else "Request (Inspector)"
+
+def _next_post_batch(items):
+    """Packs as many role sets (Inspector first) as fit in one LINE request:
+    each set's lead + cards, then ONE closing text that carries every set's
+    round code and mention, so both sets together cost a single push/reply.
+    Returns (messages, posted [(role, items, batch_code)], remaining_items, notes)."""
+    sets = split_items_by_role(items)
+    built, used = [], 1  # 1 = the shared closing text
+    for role, group in sets:
+        alt_text, bubbles = build_inspection_carousel_flex(group, role)
+        if built and used + 1 + len(bubbles) > LINE_MAX_MESSAGES:
+            break
+        used += 1 + len(bubbles)
+        built.append((role, group, alt_text, bubbles))
+    posted_roles = {r for r, *_ in built}
+    remaining = [it for it in items if item_role(it) not in posted_roles]
+    messages, posted, notes, text_parts, subs = [], [], [], [], {}
+    co = get_assignee_co()
+    for i, (role, group, alt_text, bubbles) in enumerate(built, start=1):
+        try:
+            batch_code = next_batch_code(role)
+        except Exception:
+            app.logger.exception("could not allocate batch code")
+            batch_code = None
+        lead_alt, lead = build_inspection_announce_flex(len(group), batch_code, role, items_source_label(group))
+        messages.append({"type": "flex", "altText": lead_alt, "contents": lead})
+        messages += [{"type": "flex", "altText": alt_text, "contents": b} for b in bubbles]
+        key = f"m{i}"
+        if role == ROLE_ASSIGNEE:
+            mentionee = {"type": "user", "userId": co["user_id"]} if co else {"type": "all"}
+            if not co:
+                notes.append('⚠️ ยังไม่ได้ตั้ง CO เลยแท็ก @All แทน (ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ")')
+            body = f"{{{key}}} {ASSIGNEE_MENTION_TEXT}"
+        else:
+            mentionee = {"type": "all"}
+            body = f"{{{key}}} {INSPECTOR_MENTION_TEXT}" + (f"\n{INSPECTION_FILES_URL}" if INSPECTION_FILES_URL else "")
+        subs[key] = {"type": "mention", "mentionee": mentionee}
+        # round code + doc codes go in this plain-text message on purpose:
+        # LINE's in-chat search only finds text messages, never Flex cards
+        head = f"🔖 {batch_code} · {', '.join(it['code'] for it in group)}\n" if batch_code else ""
+        text_parts.append(head + body)
+        posted.append((role, group, batch_code))
+    messages.append({"type": "textV2", "text": "\n\n".join(text_parts), "substitution": subs})
+    return messages, posted, remaining, notes
+
+def _batch_seq_snapshot():
+    keys = [_batch_prefix_and_key(r)[1] for r in (ROLE_INSPECTOR, ROLE_ASSIGNEE)]
+    return {k: get_setting(k, "0") for k in keys}
+
+def _batch_seq_restore(snap):
+    """A post that failed gives its round codes back, so numbering has no gaps."""
+    for k, v in snap.items():
+        try:
+            set_setting(k, v)
+        except Exception:
+            app.logger.exception("could not restore batch sequence")
+
+def _line_post(url, payload):
+    resp = requests.post(url, headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+                                       "Content-Type": "application/json"},
+                         json=payload, timeout=15)
+    app.logger.warning("LINE %s -> HTTP %s %s", url.rsplit("/", 1)[-1], resp.status_code, resp.text[:300])
+    resp.raise_for_status()
+
+def _record_posted(posted, group_id):
+    for role, group, batch_code in posted:
+        try:
+            save_inspection_docs(group, group_id, batch_code)
+        except Exception:
+            app.logger.exception("could not record posted inspection docs for replies")
+    try:
+        set_setting("last_inspection_post_group_id", group_id)
+    except Exception:
+        app.logger.exception("could not record last inspection post group")
+
+def _posted_lines(posted):
+    return [f"✅ {_role_label(r)} {len(g)} ฉบับ" + (f" · 🔖 {b}" if b else "") for r, g, b in posted]
+
 def handle_inspection_confirm(user_id):
+    """1:1 "ส่ง": posts the waiting list with Push (uses the monthly quota)."""
     items = get_inspection_preview(user_id)
     if not items:
         return 'ไม่มีรายการที่รอยืนยันอยู่ครับ ลองวางข้อมูลเอกสารรูปแบบ "code|doc_number|subject|date" ก่อนนะครับ'
     target = inspection_target_group_id()
     if not target:
         return ('ยังไม่ได้ตั้งกลุ่มปลายทางครับ ให้พิมพ์ "ตั้งกลุ่มแจ้งเอกสาร" ในกลุ่มที่ต้องการให้โพสต์ '
-                'แล้วกลับมาพิมพ์ "ส่ง" อีกครั้ง (รายการยังรออยู่)')
-    results, remaining = [], []
-    for role, group in split_items_by_role(items):
-        ok, line = post_role_list(target, role, group)
-        results.append(line)
-        if not ok:
-            remaining.extend(group)
-    if remaining:
-        save_inspection_preview(user_id, remaining)
-    else:
-        clear_inspection_preview(user_id)
-    try:
-        set_setting("last_inspection_post_group_id", target)
-    except Exception:
-        app.logger.exception("could not record last inspection post group")
-    msg = f"กลุ่ม \"{get_group_name(target)}\"\n" + "\n".join(results)
-    if remaining:
-        msg += '\n\nชุดที่ส่งไม่สำเร็จยังรออยู่ พิมพ์ "ส่ง" อีกครั้งเพื่อลองใหม่ หรือ "ยกเลิก"'
-    else:
-        msg += "\n(พิมพ์รหัสในช่องค้นหาของกลุ่มเพื่อหาย้อนหลัง)"
-    return msg
+                'หรือไปพิมพ์ "แจ้ง" ในกลุ่มนั้นได้เลย (รายการยังรออยู่)')
+    lines, notes = [], []
+    while items:
+        snap = _batch_seq_snapshot()
+        messages, posted, remaining, n = _next_post_batch(items)
+        try:
+            _line_post(LINE_PUSH_URL, {"to": target, "messages": messages})
+        except Exception as e:
+            app.logger.exception("inspection push failed")
+            _batch_seq_restore(snap)
+            resp = getattr(e, "response", None)
+            save_inspection_preview(user_id, items)
+            if resp is not None and resp.status_code == 429:
+                lines.append(QUOTA_HINT)
+            else:
+                detail = f" (LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})" if resp is not None else ""
+                lines.append(f"❌ โพสต์ไม่สำเร็จ{detail}\nพิมพ์ \"ส่ง\" อีกครั้ง หรือพิมพ์ \"แจ้ง\" ในกลุ่ม")
+            return f"กลุ่ม \"{get_group_name(target)}\"\n" + "\n".join(lines)
+        _record_posted(posted, target)
+        lines += _posted_lines(posted)
+        notes += n
+        items = remaining
+    clear_inspection_preview(user_id)
+    return (f"กลุ่ม \"{get_group_name(target)}\"\n" + "\n".join(lines + notes)
+            + "\n(พิมพ์รหัสในช่องค้นหาของกลุ่มเพื่อหาย้อนหลัง)")
 
-ASSIGNEE_MENTION_TEXT = os.environ.get(
-    "ASSIGNEE_MENTION_TEXT",
-    "เพื่อดำเนินการแนบรูปเข้าระบบ Site around และปิดจบเอกสารในระบบค่ะ",
-)
+def handle_group_announce(event, group_id):
+    """Group "แจ้ง" (owner only): posts the owner's waiting list into THIS
+    group as a Reply - free, never counts against the monthly Push quota.
+    One reply holds 5 messages; a set that doesn't fit stays waiting for the
+    next "แจ้ง". Nothing else is said in the group."""
+    sender_id = event.source.user_id
+    if sender_id not in owner_ids():
+        return
+    items = get_inspection_preview(sender_id)
+    if not items:
+        return
+    snap = _batch_seq_snapshot()
+    messages, posted, remaining, _ = _next_post_batch(items)
+    try:
+        _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token, "messages": messages})
+    except Exception:
+        app.logger.exception("inspection reply failed")
+        _batch_seq_restore(snap)
+        return
+    _record_posted(posted, group_id)
+    if remaining:
+        save_inspection_preview(sender_id, remaining)
+    else:
+        clear_inspection_preview(sender_id)
 
-def post_role_list(target, role, items):
-    """Posts one role's list (lead + cards + mention) to the group.
-    Returns (ok, Thai status line)."""
-    alt_text, contents = build_inspection_carousel_flex(items, role)
-    try:
-        batch_code = next_batch_code(role)
-    except Exception:
-        app.logger.exception("could not allocate batch code")
-        batch_code = None
-    lead_alt_text, lead_contents = build_inspection_announce_flex(
-        len(items), batch_code, role, items_source_label(items))
-    kwargs = {}
-    note = ""
-    if role == ROLE_ASSIGNEE:
-        co = get_assignee_co()
-        if co:
-            kwargs = {"mention_user_id": co["user_id"], "mention_text": ASSIGNEE_MENTION_TEXT}
-        else:
-            kwargs = {"mention_text": ASSIGNEE_MENTION_TEXT}
-            note = ' ⚠️ ยังไม่ได้ตั้ง CO เลยแท็ก @All แทน (ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ")'
-        kwargs["include_files_link"] = False  # CO works in Site Around itself - no files link
-    label = "รับมอบพื้นที่ (Assignee)" if role == ROLE_ASSIGNEE else "Request (Inspector)"
-    try:
-        push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents,
-                                  batch_code=batch_code, doc_codes=[it["code"] for it in items], **kwargs)
-    except Exception as e:
-        app.logger.exception("inspection push failed")
-        resp = getattr(e, "response", None)
-        detail = f" (LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})" if resp is not None else ""
-        return False, f"❌ {label} {len(items)} ฉบับ: โพสต์ไม่สำเร็จ{detail}"
-    try:
-        save_inspection_docs(items, target, batch_code)
-    except Exception:
-        app.logger.exception("could not record posted inspection docs for replies")
-    return True, f"✅ {label} {len(items)} ฉบับ" + (f" · 🔖 {batch_code}" if batch_code else "") + note
+def owner_ids():
+    return {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
 
 # --- CO: the one person tagged on Assignee (area handover) lists ---
 # Set in the group by the owner: "ตั้งผู้รับผิดชอบ CO @ชื่อ" (confirmation 1:1).
@@ -2581,7 +2645,11 @@ def send_reply_followup(force=False):
             sent.append(f'"{get_group_name(target)}" {len(docs)} ฉบับ')
         except Exception as e:
             app.logger.exception("follow-up push failed")
-            failed.append(f'"{get_group_name(target)}" ({e})')
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 429:
+                failed.append(f'"{get_group_name(target)}" (โควตา Push เดือนนี้เต็ม → พิมพ์ "ติดตาม" ในกลุ่มนั้นแทน ฟรี)')
+            else:
+                failed.append(f'"{get_group_name(target)}" ({e})')
     if sent:
         set_setting("reply_followup_last_sent", today)
     lines = []
@@ -2603,6 +2671,29 @@ def scheduled_reply_followup():
             push_to_owner(result)
     except Exception:
         app.logger.exception("scheduled reply follow-up failed")
+
+def handle_group_followup(event, group_id):
+    """Group "ติดตาม" (owner only): the same follow-up as the daily one, for
+    the docs posted in THIS group, sent as a free Reply instead of a Push."""
+    if event.source.user_id not in owner_ids():
+        return
+    by_group = get_unanswered_docs_by_group()
+    docs = list(by_group.get(group_id, []))
+    if group_id == inspection_target_group_id():
+        docs += by_group.get("", [])  # docs posted before group ids were recorded
+    if not docs:
+        return
+    docs.sort(key=lambda d: (d["posted_at"] or "", d["code"]))
+    rows, all_codes = followup_tag_plan(docs)
+    rows, all_codes = _drop_absent_members(group_id, rows, all_codes, [])
+    alt_text, contents = build_followup_flex(docs)
+    try:
+        _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token, "messages": [
+            {"type": "flex", "altText": alt_text, "contents": contents},
+            build_followup_mention_message(rows, all_codes)]})
+        set_setting("reply_followup_last_sent", bkk_today().isoformat())
+    except Exception:
+        app.logger.exception("follow-up reply failed")
 
 def build_followup_preview():
     by_group = get_unanswered_docs_by_group()
