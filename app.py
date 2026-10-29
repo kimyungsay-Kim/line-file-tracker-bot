@@ -94,6 +94,16 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
 # ---------- Storage ----------
 SCHEMA_STATEMENTS = [
+    # one row per "ส่ง" of a Request PB list, so each announcement carries a
+    # searchable round code (e.g. PB-291069-2 = 2nd round on 29/10/69)
+    """
+    CREATE TABLE IF NOT EXISTS post_batches (
+        batch_code TEXT PRIMARY KEY,
+        posted_at TEXT,
+        group_id TEXT,
+        codes TEXT
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS file_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,6 +260,10 @@ def init_db_schema():
             client.execute("ALTER TABLE inspection_docs ADD COLUMN closed_at TEXT")
         except Exception:
             pass  # column already there
+        try:  # added later: round code of the announcement the doc was posted in
+            client.execute("ALTER TABLE inspection_docs ADD COLUMN batch_code TEXT")
+        except Exception:
+            pass
     finally:
         client.close()
 
@@ -482,7 +496,8 @@ INSPECTION_FILES_URL = os.environ.get(
     "https://firsttechno.storage-readyidc.com/index.php/s/WpypEPtTLXxMkt5",
 )
 
-def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ"):
+def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ",
+                              batch_code=None, doc_codes=None):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
     given group. Uses a raw HTTP call instead of the messaging SDK's typed
@@ -495,7 +510,10 @@ def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_t
         *[{"type": "flex", "altText": flex_alt_text, "contents": b} for b in bubbles],
         {
             "type": "textV2",
-            "text": f"{{user1}} {mention_text}"
+            # the round code + doc codes go in this plain-text message on purpose:
+            # LINE's in-chat search only finds text messages, never Flex cards
+            "text": (f"🔖 {batch_code} · {', '.join(doc_codes or [])}\n" if batch_code else "")
+                    + f"{{user1}} {mention_text}"
                     + (f"\n{INSPECTION_FILES_URL}"
                        if INSPECTION_FILES_URL else ""),
             "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}},
@@ -599,7 +617,7 @@ def handle_text(event):
             parsed_items = parse_inspection_paste(text)
             if parsed_items:
                 alt_text, contents = build_inspection_carousel_flex(parsed_items)
-                lead_alt_text, lead_contents = build_inspection_announce_flex(len(parsed_items))
+                lead_alt_text, lead_contents = build_inspection_announce_flex(len(parsed_items), peek_batch_code())
                 save_inspection_preview(user_id, parsed_items)
                 reply_text_flex_text(
                     event.reply_token,
@@ -659,6 +677,8 @@ def handle_text(event):
             reply(event.reply_token, set_docs_closed(text[len("ปิดเอกสาร "):], True))
         elif text.startswith("เปิดเอกสาร "):
             reply(event.reply_token, set_docs_closed(text[len("เปิดเอกสาร "):], False))
+        elif text in ("รอบ", "รอบแจ้ง") or text.startswith("รอบ "):
+            reply(event.reply_token, handle_batch_lookup(text.split(" ", 1)[1] if " " in text else ""))
         elif text in ("คำสั่งติดตาม", "วิธีปิดเอกสาร"):
             reply(event.reply_token, FOLLOWUP_HELP_TEXT)
         elif text in ("ส่งติดตาม",):
@@ -824,7 +844,27 @@ def parse_inspection_paste(text):
 
 INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR = "#1565C0"  # the "จำนวน N ฉบับ" count phrase
 
-def build_inspection_announce_flex(n):
+BATCH_PREFIX = os.environ.get("BATCH_PREFIX", "PB").strip().upper()
+BATCH_COLOR = "#6D4C41"
+
+def batch_day_key(now=None):
+    """'291069' = 29/10/2569 (day, month, 2-digit Buddhist year)."""
+    now = now or bkk_now()
+    return f"{now.day:02d}{now.month:02d}{(now.year + 543) % 100:02d}"
+
+def peek_batch_code():
+    """Code the next "ส่ง" will get (for the preview; not reserved)."""
+    key = batch_day_key()
+    n = int(get_setting(f"batch_seq_{key}", "0") or 0) + 1
+    return f"{BATCH_PREFIX}-{key}-{n}"
+
+def next_batch_code():
+    key = batch_day_key()
+    n = int(get_setting(f"batch_seq_{key}", "0") or 0) + 1
+    set_setting(f"batch_seq_{key}", str(n))
+    return f"{BATCH_PREFIX}-{key}-{n}"
+
+def build_inspection_announce_flex(n, batch_code=None):
     """A single-line Flex bubble (not a plain TextMessage) so the "จำนวน N
     ฉบับ" count phrase can be colored - LINE's plain text messages have no
     per-span styling, only Flex text components do."""
@@ -839,10 +879,15 @@ def build_inspection_announce_flex(n):
                      "color": INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR, "weight": "bold"},
                     {"type": "span", "text": " ดังนี้ค่ะ 📑"},
                 ]
-            }]
+            }] + ([{
+                "type": "text", "wrap": True, "margin": "md", "size": "sm", "contents": [
+                    {"type": "span", "text": "🔖 รหัสรอบแจ้ง  ", "color": "#888888"},
+                    {"type": "span", "text": batch_code, "weight": "bold", "color": BATCH_COLOR},
+                ]
+            }] if batch_code else [])
         }
     }
-    alt_text = f"แจ้งข้อมูลเอกสาร Request จาก PB จำนวน {n} ฉบับ"
+    alt_text = (f"[{batch_code}] " if batch_code else "") + f"แจ้งข้อมูลเอกสาร Request จาก PB จำนวน {n} ฉบับ"
     return alt_text, contents
 
 def save_inspection_preview(user_id, items):
@@ -990,9 +1035,15 @@ def handle_inspection_confirm(user_id):
         return ('ยังไม่ได้ตั้งกลุ่มปลายทางครับ ให้พิมพ์ "ตั้งกลุ่มแจ้งเอกสาร" ในกลุ่มที่ต้องการให้โพสต์ '
                 'แล้วกลับมาพิมพ์ "ส่ง" อีกครั้ง (รายการยังรออยู่)')
     alt_text, contents = build_inspection_carousel_flex(items)
-    lead_alt_text, lead_contents = build_inspection_announce_flex(len(items))
     try:
-        push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents)
+        batch_code = next_batch_code()
+    except Exception:
+        app.logger.exception("could not allocate batch code")
+        batch_code = None
+    lead_alt_text, lead_contents = build_inspection_announce_flex(len(items), batch_code)
+    try:
+        push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents,
+                                  batch_code=batch_code, doc_codes=[it["code"] for it in items])
     except Exception as e:
         app.logger.exception("inspection push failed")
         detail = ""
@@ -1003,14 +1054,15 @@ def handle_inspection_confirm(user_id):
                 "ในกลุ่มที่ต้องการก่อน" + detail)
     clear_inspection_preview(user_id)
     try:
-        save_inspection_docs(items, target)
+        save_inspection_docs(items, target, batch_code)
     except Exception:
         app.logger.exception("could not record posted inspection docs for replies")
     try:
         set_setting("last_inspection_post_group_id", target)
     except Exception:
         app.logger.exception("could not record last inspection post group")
-    return f"โพสต์เข้ากลุ่ม \"{get_group_name(target)}\" เรียบร้อยแล้วครับ"
+    return (f"โพสต์เข้ากลุ่ม \"{get_group_name(target)}\" เรียบร้อยแล้วครับ"
+            + (f"\n🔖 รหัสรอบแจ้ง: {batch_code} (พิมพ์รหัสนี้ในช่องค้นหาของกลุ่มเพื่อหาย้อนหลัง)" if batch_code else ""))
 
 WRONG_GROUP_APOLOGY = ("🙏 ขออภัยค่ะ รายการแจ้งเอกสาร Request ด้านบนส่งผิดกลุ่ม "
                        "รบกวนไม่ต้องดำเนินการค่ะ ขอบคุณค่ะ")
@@ -1067,7 +1119,7 @@ def doc_reply_liff_url(code):
         return None
     return f"https://liff.line.me/{LIFF_ID}?doc={requests.utils.quote(code)}"
 
-def save_inspection_docs(items, group_id):
+def save_inspection_docs(items, group_id, batch_code=None):
     now_iso = bkk_now().isoformat()
     conn = db()
     try:
@@ -1075,14 +1127,20 @@ def save_inspection_docs(items, group_id):
         for it in items:
             code = normalize_doc_code(it["code"]) or it["code"].strip().upper()
             rows.append((code, it["doc_number"], it["subject"], it["date"],
-                         it.get("extra_note", ""), group_id, now_iso))
+                         it.get("extra_note", ""), group_id, now_iso, batch_code))
         conn.executemany(
-            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at) "
-            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
+            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, batch_code) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
             "doc_number = excluded.doc_number, subject = excluded.subject, date = excluded.date, "
-            "extra_note = excluded.extra_note, group_id = excluded.group_id, posted_at = excluded.posted_at",
+            "extra_note = excluded.extra_note, group_id = excluded.group_id, posted_at = excluded.posted_at, "
+            "batch_code = excluded.batch_code",
             rows,
         )
+        if batch_code:
+            conn.execute(
+                "INSERT INTO post_batches (batch_code, posted_at, group_id, codes) VALUES (?,?,?,?) "
+                "ON CONFLICT(batch_code) DO UPDATE SET codes = excluded.codes",
+                (batch_code, now_iso, group_id, ",".join(r[0] for r in rows)))
     finally:
         conn.close()
 
@@ -1447,7 +1505,7 @@ def get_docs_status(days):
     conn = db()
     try:
         docs = conn.execute(
-            "SELECT code, subject, date, posted_at, group_id, closed_at FROM inspection_docs "
+            "SELECT code, subject, date, posted_at, group_id, closed_at, batch_code FROM inspection_docs "
             "WHERE posted_at >= ? ORDER BY posted_at, code", (since,)).fetchall()
         replies = conn.execute(
             "SELECT r.code, r.user_id, r.user_name, r.text FROM doc_replies r "
@@ -1468,7 +1526,7 @@ def get_docs_status(days):
         info["latest"] = f"{name}: {text}"
     teams = load_buddy_teams()
     out = []
-    for code, subject, date, posted_at, group_id, closed_at in docs:
+    for code, subject, date, posted_at, group_id, closed_at, batch_code in docs:
         info = by_code.get(code, {"ids": set(), "n": 0, "latest": None})
         status = doc_team_status(code, subject, teams, info["ids"])
         if closed_at:
@@ -1479,11 +1537,51 @@ def get_docs_status(days):
             pending = not all(s["done"] for s in status)
         out.append({"code": code, "subject": subject, "date": date, "posted_at": posted_at,
                     "group_id": group_id or "", "closed": bool(closed_at), "status": status,
+                    "batch_code": batch_code or "",
                     "n": info["n"], "latest": info["latest"], "pending": pending})
     return out
 
 def team_status_line(status):
     return "   ".join(f"{'✅' if s['done'] else '⏳'} {s['label']}" for s in status)
+
+BATCH_LIST_DAYS = 3
+
+def handle_batch_lookup(arg):
+    """'รอบ' -> rounds of the last few days; 'รอบ PB-291069-2' -> its docs;
+    'รอบ ST-814' / 'รอบ RIH-I02376' -> which round that doc was posted in."""
+    arg = (arg or "").strip().upper()
+    conn = db()
+    try:
+        if not arg:
+            since = (bkk_now() - datetime.timedelta(days=BATCH_LIST_DAYS)).isoformat()
+            rows = conn.execute("SELECT batch_code, posted_at, codes FROM post_batches WHERE posted_at >= ? "
+                                "ORDER BY posted_at DESC", (since,)).fetchall()
+            if not rows:
+                return f"ยังไม่มีรอบแจ้งใน {BATCH_LIST_DAYS} วันล่าสุดครับ"
+            out = [f"🔖 รอบแจ้ง {BATCH_LIST_DAYS} วันล่าสุด"]
+            for b, at, codes in rows:
+                out.append(f"• {b}  ({_fmt_dt(at)} น.)\n   {codes.replace(',', ', ')}")
+            out.append('\nพิมพ์รหัสรอบในช่องค้นหาของกลุ่ม LINE เพื่อเลื่อนไปที่ข้อความนั้น · '
+                       'ทั้งวัน: พิมพ์แค่ส่วนวันที่ เช่น ' + f"{BATCH_PREFIX}-{batch_day_key()}")
+            return "\n".join(out)
+        row = conn.execute("SELECT batch_code, posted_at, codes FROM post_batches WHERE batch_code = ?",
+                           (arg,)).fetchone()
+        if row:
+            return f"🔖 {row[0]}  ({_fmt_dt(row[1])} น.)\n{row[2].replace(',', ', ')}"
+    finally:
+        conn.close()
+    code = find_doc_code(arg)
+    if code:
+        doc = get_inspection_doc(code) or {}
+        conn = db()
+        try:
+            r = conn.execute("SELECT batch_code, posted_at FROM inspection_docs WHERE code = ?", (code,)).fetchone()
+        finally:
+            conn.close()
+        if r and r[0]:
+            return f"{code} แจ้งในรอบ 🔖 {r[0]} ({_fmt_dt(r[1])} น.)"
+        return f"{code} โพสต์ก่อนมีรหัสรอบครับ ({_fmt_dt(r[1]) if r else '-'} น.)"
+    return f"ไม่พบรอบหรือเอกสาร {arg} ครับ"
 
 FOLLOWUP_HELP_TEXT = (
     "🛠 คำสั่งจัดการรายการติดตาม (พิมพ์ในแชตนี้)\n\n"
@@ -1837,7 +1935,9 @@ def build_followup_flex(docs):
         body.append(txt(d["subject"] or "-", size="xs", color="#444444", margin="none"))
         if d["status"]:
             body.append(txt(team_status_line(d["status"]), size="xs", color="#333333", margin="xs"))
-        meta = [txt(f"ส่งเข้าระบบ {d['date']}" if d["date"] else "-", size="xxs", color="#999999", flex=1)]
+        meta_txt = " · ".join(x for x in [f"ส่งเข้าระบบ {d['date']}" if d["date"] else "",
+                                            f"รอบ {d['batch_code']}" if d.get("batch_code") else ""] if x) or "-"
+        meta = [txt(meta_txt, size="xxs", color="#999999", flex=1)]
         link = doc_reply_liff_url(code)
         if link:
             meta.append({"type": "text", "text": "💬 ตอบกลับ", "size": "xs", "weight": "bold",
