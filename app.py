@@ -1972,11 +1972,12 @@ def build_followup_mention_message(rows, all_codes):
             keys.append(f"{{u{n}}}")
         lines.append(f"▸ {row['label']} {' '.join(keys)}")
         lines.append(f"   {_codes_text(row['codes'])}")
+        lines.append("")  # blank line between teams so each group stands apart
     if all_codes:
         subs["all"] = {"type": "mention", "mentionee": {"type": "all"}}
         lines.append("▸ ยังไม่มีผู้รับผิดชอบ {all}")
         lines.append(f"   {', '.join(all_codes)}")
-    lines.append("")
+        lines.append("")
     if any(shared for r in rows for _, shared in r["codes"]):
         lines.append("* หัวเรื่องไม่ระบุอาคาร — ทีม EE-A หรือ EE-B ตอบทีมใดทีมหนึ่งก็พอ")
     lines.append(REMIND_TAG_FOOTER)
@@ -2076,7 +2077,7 @@ def build_followup_preview():
         lines.append(f"▸ {row['label']} {names}\n   {_codes_text(row['codes'])}")
     if all_codes:
         lines.append(f"▸ @All (ยังไม่มีผู้รับผิดชอบ)\n   {', '.join(all_codes)}")
-    return (alt_text, contents, "\n".join(lines))
+    return (alt_text, contents, "\n\n".join(lines))
 
 # --- LIFF page + JSON API ---
 LINE_VERIFY_ID_TOKEN_URL = "https://api.line.me/oauth2/v2.1/verify"
