@@ -1650,6 +1650,7 @@ FOLLOWUP_HELP_TEXT = (
     "   SN/FP ตอบแล้ว AR-338\n"
     "   EE-A ตอบแล้ว AR-338 AR-340\n"
     "   → นับเฉพาะทีมนั้น ทีมอื่นที่ยังไม่ตอบยังถูกแท็กต่อ\n\n"
+    "   ช่วงเลข: AC,SN/FP ตอบแล้ว AR-325 ถึง ST-802\n\n"
     "③ ปิดทั้งฉบับ (ไม่ติดตามอีก ทุกทีม)\n"
     "   ปิดเอกสาร AR-338 ST-805\n\n"
     "📚 สารบัญรอบแจ้ง: \"สารบัญสัปดาห์\" / \"สารบัญสัปดาห์ก่อน\" (ก็อปไปวางใน Note) · \"รอบ\"\n\n"
@@ -1659,6 +1660,10 @@ FOLLOWUP_HELP_TEXT = (
 
 def set_docs_closed(raw, closed):
     """ปิด/เปิดเอกสาร for one or more codes or document numbers."""
+    if RANGE_WORD_RE.search(raw or ""):
+        raw, bad = expand_code_ranges(raw)
+        if bad:
+            return bad
     refs = [r for r in re.split(r"[\s,]+", raw or "") if r]
     if not refs:
         return set_doc_closed("", closed)
@@ -1836,6 +1841,44 @@ def find_doc_code(ref):
     tail = [c for c, n in rows if (n or "").strip().upper().endswith(ref_u)]
     return tail[0] if len(tail) == 1 else None
 
+RANGE_WORD_RE = re.compile(r"\s*(?:ถึง|~|→|->)\s*")
+
+def expand_code_ranges(rest):
+    """'AR-325 ถึง ST-802' -> every tracked doc from AR-325 to ST-802 in
+    document-number order (RIH-I numbers run across AR/ST), so a range can span
+    prefixes. Same prefix with no doc numbers falls back to the code numbers.
+    Returns (expanded text, error message or None)."""
+    conn = db()
+    try:
+        rows = conn.execute("SELECT code, doc_number, posted_at FROM inspection_docs").fetchall()
+    finally:
+        conn.close()
+    num = {}
+    for c, n, _ in rows:
+        digits = re.sub(r"\D", "", (n or "").split("-")[-1])
+        num[c] = int(digits) if digits else None
+    tokens = [t for t in re.split(r"[\s,]+", RANGE_WORD_RE.sub(" ถึง ", rest)) if t]
+    out, i = [], 0
+    while i < len(tokens):
+        if i + 2 < len(tokens) and tokens[i + 1] == "ถึง":
+            a, b = find_doc_code(tokens[i]), find_doc_code(tokens[i + 2])
+            if not a or not b:
+                return rest, f"ไม่พบเอกสาร {tokens[i] if not a else tokens[i + 2]} ในระบบบอทครับ"
+            if num.get(a) is not None and num.get(b) is not None:
+                lo, hi = sorted((num[a], num[b]))
+                picked = sorted((c for c, v in num.items() if v is not None and lo <= v <= hi), key=lambda c: num[c])
+            elif doc_prefix(a) == doc_prefix(b):
+                lo, hi = sorted((int(a.split("-")[1]), int(b.split("-")[1])))
+                picked = [c for c in num if doc_prefix(c) == doc_prefix(a) and lo <= int(c.split("-")[1]) <= hi]
+            else:
+                return rest, f"ช่วง {a} ถึง {b} ข้ามหมวดแต่ไม่มีเลขที่เอกสาร RIH-I ให้เรียงลำดับครับ ใส่ทีละเลขแทน"
+            out += picked
+            i += 3
+        else:
+            out.append(tokens[i])
+            i += 1
+    return " ".join(out), None
+
 def handle_manual_answer(user_id, text):
     """Returns a reply string, or None if the text isn't this command."""
     m = MANUAL_ANSWER_RE.match(text)
@@ -1846,6 +1889,13 @@ def handle_manual_answer(user_id, text):
         return None
     label = (m.group(1) or MANUAL_ANSWER_DEFAULT_TEAM).upper()
     action, rest = m.group(2), (m.group(3) or "").strip()
+    labels = [x for x in re.split(r"[,+]", label) if x]
+    if len(labels) > 1:  # "AC,SN/FP ตอบแล้ว ..." -> once per team
+        return "\n\n".join(handle_manual_answer(user_id, f"{x} {action} {rest}".strip()) or "" for x in labels)
+    if RANGE_WORD_RE.search(rest) and "\n" not in rest:
+        rest, bad = expand_code_ranges(rest)
+        if bad:
+            return bad
     teams = {t["label"]: t for t in load_buddy_teams()}
     team = teams.get(label)
     if not team:
