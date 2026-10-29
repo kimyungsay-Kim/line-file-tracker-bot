@@ -1235,7 +1235,7 @@ def handle_inspection_confirm(user_id):
 
 ASSIGNEE_MENTION_TEXT = os.environ.get(
     "ASSIGNEE_MENTION_TEXT",
-    "เพื่อดำเนินการแนบรูปเข้าระบบ Site around และปิดจบเอกสารในระบบ",
+    "เพื่อดำเนินการแนบรูปเข้าระบบ Site around และปิดจบเอกสารในระบบค่ะ",
 )
 
 def post_role_list(target, role, items):
