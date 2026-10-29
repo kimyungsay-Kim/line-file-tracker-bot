@@ -1281,21 +1281,48 @@ def get_doc_replies(code):
         conn.close()
     return [dict(zip(("user_name", "text", "source", "created_at", "user_id"), r)) for r in rows]
 
+CODE_LINE_RE = re.compile(r"^\s*([A-Za-z]{1,5})\s*-?\s*(\d{1,5})\b\s*[:：\-–]?\s*(.*)$")
+
+def split_code_lines(text):
+    """Splits a message where several lines each start with a doc code
+    ("AR-325 SN&FP ไม่มีงาน\nAR-326 ...") into [(code, message)]. Lines that
+    don't start with a code continue the previous one. [] if the first
+    non-empty line has no code."""
+    out = []
+    for ln in (text or "").splitlines():
+        if not ln.strip():
+            continue
+        m = CODE_LINE_RE.match(ln)
+        if m:
+            out.append([f"{m.group(1).upper()}-{int(m.group(2))}", m.group(3).strip()])
+        elif out:
+            out[-1][1] = (out[-1][1] + " " + ln.strip()).strip()
+        else:
+            return []
+    return [(c, t) for c, t in out]
+
 def record_group_reply_shortcut(group_id, user_id, text):
     """Returns True when the text was saved as a reply. Only codes that were
     actually posted count, so ordinary chat that happens to start with
-    something like "EE-1 ..." isn't swallowed by mistake."""
-    m = REPLY_SHORTCUT_RE.match(text or "")
-    if not m:
-        return False
-    code = f"{m.group(1).upper()}-{int(m.group(2))}"
-    if not get_inspection_doc(code):
-        return False
-    name = get_profile_name(group_id, user_id) if user_id else "ไม่ทราบชื่อ"
-    saved = add_doc_reply(code, user_id, name, m.group(3), "group")
-    if saved:
-        after_doc_reply(code, user_id, name, m.group(3).strip())
-    return saved
+    something like "EE-1 ..." isn't swallowed by mistake. A message with one
+    code per line is saved as a separate reply for each code."""
+    entries = [(c, t) for c, t in split_code_lines(text) if t]
+    if len(entries) < 2:
+        m = REPLY_SHORTCUT_RE.match(text or "")
+        if not m:
+            return False
+        entries = [(f"{m.group(1).upper()}-{int(m.group(2))}", m.group(3).strip())]
+    name = None
+    saved_any = False
+    for code, msg in entries:
+        if not get_inspection_doc(code):
+            continue
+        if name is None:
+            name = get_profile_name(group_id, user_id) if user_id else "ไม่ทราบชื่อ"
+        if add_doc_reply(code, user_id, name, msg, "group"):
+            saved_any = True
+            after_doc_reply(code, user_id, name, msg)
+    return saved_any
 
 def _fmt_dt(iso):
     try:
@@ -1806,6 +1833,35 @@ def handle_manual_answer(user_id, text):
         for code in targets:
             add_doc_reply(code, marker, f"ทีม {label} (แจ้งผ่านแอดมิน)", "ตอบแล้ว (ตอบส่วนตัวกับแอดมิน)", "owner")
         return f"✅ บันทึกว่าทีม {label} ตอบครบแล้ว {len(targets)} ฉบับ: {', '.join(targets)}"
+
+    lined = split_code_lines(rest) if "\n" in rest else []
+    if action == "ตอบแล้ว" and lined and any(t for _, t in lined):
+        # pasted reply lines, e.g. copied from a teammate's message:
+        #   SN/FP ตอบแล้ว
+        #   AR-325 SN&FP ไม่มีงาน
+        #   AR-326 SN&FP มีงานติดตั้ง Sleeve
+        ok, skipped, unknown = [], [], []
+        for ref, msg in lined:
+            code = find_doc_code(ref)
+            if not code:
+                unknown.append(ref)
+                continue
+            if doc_prefix(code) not in team["prefixes"]:
+                skipped.append(code)
+                continue
+            conn = db()
+            try:
+                conn.execute("DELETE FROM doc_replies WHERE code = ? AND user_id = ?", (code, marker))
+            finally:
+                conn.close()
+            add_doc_reply(code, marker, f"ทีม {label} (แจ้งผ่านแอดมิน)", msg or "ตอบแล้ว", "owner")
+            ok.append(f"{code}" + (f" — {msg[:40]}" if msg else ""))
+        out = [f"✅ บันทึกคำตอบทีม {label} แล้ว {len(ok)} ฉบับ"] + [f"• {x}" for x in ok]
+        if skipped:
+            out.append(f"ข้าม (ทีม {label} ไม่ได้รับผิดชอบหมวดนี้): {', '.join(skipped)}")
+        if unknown:
+            out.append(f"ไม่พบเอกสาร: {', '.join(unknown)} (เพิ่มเข้าระบบก่อนด้วย \"{TRACK_BACKFILL_CMD}\")")
+        return "\n".join(out)
 
     refs = [r for r in re.split(r"[\s,]+", rest) if r]
     if not refs:
