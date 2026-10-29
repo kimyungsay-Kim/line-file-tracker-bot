@@ -1706,8 +1706,9 @@ def handle_manual_answer(user_id, text):
 # Every working day the bot posts, into the group each document was posted to,
 # the Request PB documents from the last REMIND_WINDOW_DAYS days still waiting
 # for an answer (oldest first, days waited, which buddy teams are still due),
-# then tags exactly the people whose team still owes an answer (@All for docs
-# with no team set). Groups with nothing outstanding get nothing.
+# then one mention line per buddy team listing only the codes that team still
+# owes (a team that already answered a doc is not tagged for it; @All line for
+# docs with no team set). Groups with nothing outstanding get nothing.
 #   1:1 "ติดตาม"     -> preview what would be posted (reply, free)
 #   1:1 "ส่งติดตาม"  -> post it to the group(s) right now
 REMIND_HOUR = int(os.environ.get("REMIND_HOUR", "9"))
@@ -1716,12 +1717,6 @@ REMIND_DAYS_OF_WEEK = os.environ.get("REMIND_DAYS_OF_WEEK", "mon-sat")  # APSche
 REMIND_WINDOW_DAYS = int(os.environ.get("REMIND_WINDOW_DAYS", str(REPLIES_OVERVIEW_DAYS)))
 REMIND_LATE_DAYS = int(os.environ.get("REMIND_LATE_DAYS", "3"))   # waited this long or more -> red
 REMIND_MAX_DOCS = 25
-REMIND_MAX_MENTIONS = 20
-REMIND_MENTION_TEXT = os.environ.get(
-    "REMIND_MENTION_TEXT",
-    "รบกวนตรวจสอบและตอบกลับเอกสาร Request PB ที่ยังค้างด้านบนด้วยนะคะ "
-    'กด "💬 ตอบกลับ" ใต้เอกสาร หรือพิมพ์รหัสตามด้วยข้อความในกลุ่ม เช่น "AR-337 ตรวจแล้ว" ค่ะ',
-)
 REMIND_HEADER_COLOR = "#E65100"
 REMIND_WAIT_COLOR = "#EF6C00"
 
@@ -1740,22 +1735,43 @@ def _days_waiting(posted_at):
         return 0
     return max((bkk_today() - posted).days, 0)
 
-def followup_tag_targets(docs):
-    """(user_ids to mention, needs @All) for a list of pending docs."""
-    ids, need_all = [], False
+def followup_tag_plan(docs):
+    """Per-team breakdown of who still owes which document.
+    Returns (rows, all_codes):
+      rows      = [{"label", "member_ids", "codes": [(code, shared)]}] - one row per
+                  buddy team that still owes at least one doc; `shared` = either of two
+                  teams may answer (building not named in the subject)
+      all_codes = codes with nobody specific to tag (no buddy team for the doc or
+                  for one of its systems) -> those go on an @All line
+    A team that already answered a doc never gets that doc on its line."""
+    teams = {t["label"]: t for t in load_buddy_teams()}
+    rows, all_codes = {}, []
     for d in docs:
+        code = d["code"]
         if d["status"] is None:
-            need_all = True
+            if code not in all_codes:
+                all_codes.append(code)
             continue
-        if any(s.get("missing") for s in d["status"]):
-            need_all = True  # a system with no buddy team - nobody specific to tag
-        for s in d["status"]:
-            for u in s["tag_ids"]:
-                if u not in ids:
-                    ids.append(u)
-    if len(ids) > REMIND_MAX_MENTIONS:
-        return ([], True)
-    return (ids, need_all)
+        for st in d["status"]:
+            if st["done"]:
+                continue
+            if st.get("missing") or not st["teams"]:
+                if code not in all_codes:
+                    all_codes.append(code)
+                continue
+            shared = len(st["teams"]) > 1
+            for label in st["teams"]:
+                team = teams.get(label)
+                if not team:
+                    continue
+                row = rows.setdefault(label, {"label": label, "member_ids": list(team["members"]), "codes": []})
+                if all(c != code for c, _ in row["codes"]):
+                    row["codes"].append((code, shared))
+    order = sorted(rows.values(), key=lambda r: (-len(r["codes"]), r["label"]))
+    return (order, all_codes)
+
+def _codes_text(codes):
+    return ", ".join(f"{c}*" if shared else c for c, shared in codes)
 
 def build_followup_flex(docs):
     txt = flex_txt
@@ -1793,19 +1809,38 @@ def build_followup_flex(docs):
                 "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body}}
     return (f"🔔 ติดตามการตอบกลับเอกสาร Request PB: ยังรอคำตอบ {len(docs)} ฉบับ", contents)
 
-def build_followup_mention_message(user_ids, need_all):
-    keys, subs = [], {}
-    if need_all or not user_ids:
-        keys.append("{all}")
-        subs["all"] = {"type": "mention", "mentionee": {"type": "all"}}
-    for i, uid in enumerate(user_ids, 1):
-        keys.append(f"{{u{i}}}")
-        subs[f"u{i}"] = {"type": "mention", "mentionee": {"type": "user", "userId": uid}}
-    return {"type": "textV2", "text": " ".join(keys) + " " + REMIND_MENTION_TEXT, "substitution": subs}
+REMIND_TAG_HEADER = os.environ.get("REMIND_TAG_HEADER", "📌 รายการที่ยังค้างตอบ แยกตามผู้รับผิดชอบ")
+REMIND_TAG_FOOTER = os.environ.get(
+    "REMIND_TAG_FOOTER",
+    'รบกวนตอบกลับเฉพาะเลขที่ในบรรทัดของตัวเองนะคะ กด "💬 ตอบกลับ" ใต้เอกสาร '
+    'หรือพิมพ์รหัสตามด้วยข้อความในกลุ่ม เช่น "AR-337 ตรวจแล้ว" ค่ะ',
+)
 
-def push_followup_to_group(group_id, alt_text, contents, user_ids, need_all):
+def build_followup_mention_message(rows, all_codes):
+    """textV2 message: one line per team that still owes something, tagging only
+    that team's members followed by the codes it still owes."""
+    lines, subs, n = [REMIND_TAG_HEADER, ""], {}, 0
+    for row in rows:
+        keys = []
+        for uid in row["member_ids"]:
+            n += 1
+            subs[f"u{n}"] = {"type": "mention", "mentionee": {"type": "user", "userId": uid}}
+            keys.append(f"{{u{n}}}")
+        lines.append(f"▸ {row['label']} {' '.join(keys)}")
+        lines.append(f"   {_codes_text(row['codes'])}")
+    if all_codes:
+        subs["all"] = {"type": "mention", "mentionee": {"type": "all"}}
+        lines.append("▸ ยังไม่มีผู้รับผิดชอบ {all}")
+        lines.append(f"   {', '.join(all_codes)}")
+    lines.append("")
+    if any(shared for r in rows for _, shared in r["codes"]):
+        lines.append("* หัวเรื่องไม่ระบุอาคาร — ทีม EE-A หรือ EE-B ตอบทีมใดทีมหนึ่งก็พอ")
+    lines.append(REMIND_TAG_FOOTER)
+    return {"type": "textV2", "text": "\n".join(lines), "substitution": subs}
+
+def push_followup_to_group(group_id, alt_text, contents, rows, all_codes):
     messages = [{"type": "flex", "altText": alt_text, "contents": contents},
-                build_followup_mention_message(user_ids, need_all)]
+                build_followup_mention_message(rows, all_codes)]
     resp = requests.post(
         LINE_PUSH_URL,
         headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
@@ -1814,6 +1849,25 @@ def push_followup_to_group(group_id, alt_text, contents, user_ids, need_all):
     )
     app.logger.warning("follow-up push to %s -> HTTP %s %s", group_id, resp.status_code, resp.text[:300])
     resp.raise_for_status()
+
+def _drop_absent_members(target, rows, all_codes, missing):
+    """Removes people no longer in the group; a team left with nobody moves its
+    codes onto the @All line so the reminder still reaches the group."""
+    kept = []
+    for row in rows:
+        present = []
+        for uid in row["member_ids"]:
+            if group_member_ok(target, uid):
+                present.append(uid)
+            elif uid not in missing:
+                missing.append(uid)
+        if present:
+            kept.append(dict(row, member_ids=present))
+        else:
+            for code, _ in row["codes"]:
+                if code not in all_codes:
+                    all_codes.append(code)
+    return kept, all_codes
 
 def send_reply_followup(force=False):
     """Posts the follow-up to every group with docs still waiting. Returns a
@@ -1832,18 +1886,11 @@ def send_reply_followup(force=False):
         if not target:
             failed.append(f"{len(docs)} ฉบับ (ไม่รู้กลุ่มปลายทาง)")
             continue
-        user_ids, need_all = followup_tag_targets(docs)
-        present = []
-        for uid in user_ids:
-            if group_member_ok(target, uid):
-                present.append(uid)
-            else:
-                missing.append(uid)
-        if len(present) < len(user_ids):
-            need_all = True  # someone who should answer has left - make sure the group still hears it
+        rows, all_codes = followup_tag_plan(docs)
+        rows, all_codes = _drop_absent_members(target, rows, all_codes, missing)
         alt_text, contents = build_followup_flex(docs)
         try:
-            push_followup_to_group(target, alt_text, contents, present, need_all)
+            push_followup_to_group(target, alt_text, contents, rows, all_codes)
             sent.append(f'"{get_group_name(target)}" {len(docs)} ฉบับ')
         except Exception as e:
             app.logger.exception("follow-up push failed")
@@ -1859,7 +1906,7 @@ def send_reply_followup(force=False):
         teams = load_buddy_teams()
         labels = sorted({t["label"] for t in teams for u in missing if u in t["members"]})
         lines.append(f"⚠️ มีผู้รับผิดชอบ {len(missing)} คนไม่อยู่ในกลุ่มแล้ว (บัดดี้ {', '.join(labels)}) "
-                     "จึงแท็ก @All แทน — ตั้งคนใหม่ด้วย \"ตั้งบัดดี้\" ในกลุ่ม")
+                     "(ถ้าทั้งทีมไม่อยู่ เลขที่ของทีมนั้นย้ายไปแท็ก @All) — ตั้งคนใหม่ด้วย \"ตั้งบัดดี้\" ในกลุ่ม")
     return "\n".join(lines)
 
 def scheduled_reply_followup():
@@ -1877,12 +1924,15 @@ def build_followup_preview():
     docs = [d for group_docs in by_group.values() for d in group_docs]
     docs.sort(key=lambda d: (d["posted_at"] or "", d["code"]))
     alt_text, contents = build_followup_flex(docs)
-    user_ids, need_all = followup_tag_targets(docs)
+    rows, all_codes = followup_tag_plan(docs)
     group_for_names = next(iter(by_group)) or inspection_target_group_id()
-    who = [get_profile_name(group_for_names, u) for u in user_ids]
-    if need_all:
-        who.insert(0, "@All")
-    return (alt_text, contents, "จะแท็ก: " + (", ".join(who) if who else "@All"))
+    lines = ["จะแท็กแยกคน (เฉพาะเลขที่ที่ยังไม่ได้ตอบ):"]
+    for row in rows:
+        names = " ".join("@" + get_profile_name(group_for_names, u) for u in row["member_ids"])
+        lines.append(f"▸ {row['label']} {names}\n   {_codes_text(row['codes'])}")
+    if all_codes:
+        lines.append(f"▸ @All (ยังไม่มีผู้รับผิดชอบ)\n   {', '.join(all_codes)}")
+    return (alt_text, contents, "\n".join(lines))
 
 # --- LIFF page + JSON API ---
 LINE_VERIFY_ID_TOKEN_URL = "https://api.line.me/oauth2/v2.1/verify"
