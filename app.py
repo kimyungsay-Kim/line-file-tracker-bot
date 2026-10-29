@@ -648,7 +648,7 @@ def handle_text(event):
             else:
                 reply_flex_and_text(event.reply_token, alt_text, contents,
                                     f'{who}\n\nตัวอย่างข้อความติดตามที่จะส่งเข้ากลุ่มอัตโนมัติ {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น. '
-                                    f'({REMIND_DAYS_OF_WEEK}) — ถ้าต้องการส่งตอนนี้เลย พิมพ์ "ส่งติดตาม" ครับ')
+                                    f'({REMIND_DAYS_OF_WEEK}) — ถ้าต้องการส่งตอนนี้เลย พิมพ์ "ส่งติดตาม" ครับ' + '\nบันทึกว่าตอบแล้ว/ปิดบางรายการ: พิมพ์ "คำสั่งติดตาม"')
         elif text in ("บัดดี้", "ผู้รับผิดชอบ"):
             reply(event.reply_token, build_buddy_list_text())
         elif text.startswith("ลบบัดดี้ "):
@@ -656,9 +656,11 @@ def handle_text(event):
             reply(event.reply_token, f"ลบบัดดี้ {label} แล้วครับ" if delete_buddy_team(label)
                   else f"ไม่พบบัดดี้ชื่อ {label} ครับ (พิมพ์ \"บัดดี้\" เพื่อดูรายชื่อ)")
         elif text.startswith("ปิดเอกสาร "):
-            reply(event.reply_token, set_doc_closed(text[len("ปิดเอกสาร "):], True))
+            reply(event.reply_token, set_docs_closed(text[len("ปิดเอกสาร "):], True))
         elif text.startswith("เปิดเอกสาร "):
-            reply(event.reply_token, set_doc_closed(text[len("เปิดเอกสาร "):], False))
+            reply(event.reply_token, set_docs_closed(text[len("เปิดเอกสาร "):], False))
+        elif text in ("คำสั่งติดตาม", "วิธีปิดเอกสาร"):
+            reply(event.reply_token, FOLLOWUP_HELP_TEXT)
         elif text in ("ส่งติดตาม",):
             reply(event.reply_token, send_reply_followup(force=True))
         elif text.startswith("คำตอบ "):
@@ -1482,6 +1484,45 @@ def get_docs_status(days):
 
 def team_status_line(status):
     return "   ".join(f"{'✅' if s['done'] else '⏳'} {s['label']}" for s in status)
+
+FOLLOWUP_HELP_TEXT = (
+    "🛠 คำสั่งจัดการรายการติดตาม (พิมพ์ในแชตนี้)\n\n"
+    "① AC แจ้งคุณส่วนตัวแล้ว\n"
+    "   ตอบแล้ว ST-803 ST-804\n"
+    "   AC ตอบครบแล้ว   (ทุกเลขที่ยังรอ AC)\n\n"
+    "② ทีมอื่นตอบโดยไม่ระบุเลข / แจ้งส่วนตัว\n"
+    "   SN/FP ตอบแล้ว AR-338\n"
+    "   EE-A ตอบแล้ว AR-338 AR-340\n"
+    "   → นับเฉพาะทีมนั้น ทีมอื่นที่ยังไม่ตอบยังถูกแท็กต่อ\n\n"
+    "③ ปิดทั้งฉบับ (ไม่ติดตามอีก ทุกทีม)\n"
+    "   ปิดเอกสาร AR-338 ST-805\n\n"
+    "↩️ ยกเลิก: \"AC ยกเลิกตอบแล้ว ST-803\" · \"เปิดเอกสาร AR-338\"\n"
+    "ใช้เลขที่เอกสารแทนรหัสได้ เช่น RIH-I02330 หรือ I02330 · คั่นหลายเลขด้วยเว้นวรรคหรือ ,"
+)
+
+def set_docs_closed(raw, closed):
+    """ปิด/เปิดเอกสาร for one or more codes or document numbers."""
+    refs = [r for r in re.split(r"[\s,]+", raw or "") if r]
+    if not refs:
+        return set_doc_closed("", closed)
+    if len(refs) == 1:
+        code = find_doc_code(refs[0])
+        return set_doc_closed(code or refs[0], closed)
+    ok, unknown = [], []
+    for ref in refs:
+        code = find_doc_code(ref)
+        if code:
+            set_doc_closed(code, closed)
+            ok.append(code)
+        else:
+            unknown.append(ref)
+    lines = []
+    if ok:
+        lines.append((f"🔒 ปิดเอกสารแล้ว {len(ok)} ฉบับ: " if closed else f"🔓 เปิดเอกสารคืนแล้ว {len(ok)} ฉบับ: ")
+                     + ", ".join(ok))
+    if unknown:
+        lines.append("ไม่พบเอกสาร: " + ", ".join(unknown))
+    return "\n".join(lines)
 
 def set_doc_closed(raw_code, closed):
     code = normalize_doc_code(raw_code)
