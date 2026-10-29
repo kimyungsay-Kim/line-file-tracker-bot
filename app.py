@@ -268,6 +268,10 @@ def init_db_schema():
             client.execute("ALTER TABLE inspection_docs ADD COLUMN source TEXT")
         except Exception:
             pass
+        try:  # added later: Site Around role the doc came from ("I" Inspector / "A" Assignee)
+            client.execute("ALTER TABLE inspection_docs ADD COLUMN role TEXT")
+        except Exception:
+            pass
     finally:
         client.close()
 
@@ -499,6 +503,33 @@ def reply_text_flex_text(reply_token, lead_alt_text, lead_contents, alt_text, co
             )
         ))
 
+def reply_inspection_preview(reply_token, items):
+    """1:1 preview of a pasted list, one lead + cards set per role (Inspector
+    first). A reply carries at most 5 messages, so when both roles together
+    need more, each role keeps its lead and first card and the rest is noted."""
+    sets = []
+    for role, group in split_items_by_role(items):
+        alt_text, bubbles = build_inspection_carousel_flex(group, role)
+        lead_alt, lead = build_inspection_announce_flex(
+            len(group), peek_batch_code(role), role, items_source_label(group))
+        sets.append((lead_alt, lead, alt_text, bubbles))
+    trailing = 'ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
+    if len(sets) > 1:
+        trailing = "ตอนส่งจะโพสต์ 2 ชุดแยกกัน (Inspector ก่อน แล้วตามด้วยรับมอบพื้นที่)\n" + trailing
+    if any(role == ROLE_ASSIGNEE for role, _ in split_items_by_role(items)) and not get_assignee_co():
+        trailing += '\n⚠️ ยังไม่ได้ตั้ง CO ชุดรับมอบพื้นที่จะแท็ก @All แทน — ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ"'
+    total = sum(1 + len(b) for _, _, _, b in sets) + 1
+    if total > 5:
+        sets = [(la, l, a, b[:1]) for la, l, a, b in sets]
+        trailing = "(ตัวอย่างแสดงไม่ครบเพราะ LINE ส่งได้ครั้งละ 5 ข้อความ ตอนส่งจริงจะครบ)\n" + trailing
+    messages = []
+    for lead_alt, lead, alt_text, bubbles in sets:
+        messages.append(FlexMessage(alt_text=lead_alt, contents=FlexContainer.from_dict(lead)))
+        messages += [FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(b)) for b in bubbles]
+    messages = messages[:4] + [TextMessage(text=trailing)]
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=reply_token, messages=messages))
+
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 # Shared folder holding the inspection document files, linked under the
@@ -509,13 +540,14 @@ INSPECTION_FILES_URL = os.environ.get(
 )
 
 def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ",
-                              batch_code=None, doc_codes=None):
+                              batch_code=None, doc_codes=None, mention_user_id=None):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
-    given group. Uses a raw HTTP call instead of the messaging SDK's typed
-    message classes because the installed line-bot-sdk version here doesn't
-    expose LINE's textV2/mention payload - this builds that payload
-    directly, per LINE's documented format."""
+    given group. mention_user_id tags just that one person instead (e.g. the
+    CO for Assignee lists). Uses a raw HTTP call instead of the messaging
+    SDK's typed message classes because the installed line-bot-sdk version
+    here doesn't expose LINE's textV2/mention payload - this builds that
+    payload directly, per LINE's documented format."""
     bubbles = flex_contents if isinstance(flex_contents, list) else [flex_contents]
     messages = [
         {"type": "flex", "altText": lead_alt_text, "contents": lead_contents},
@@ -528,7 +560,8 @@ def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_t
                     + f"{{user1}} {mention_text}"
                     + (f"\n{INSPECTION_FILES_URL}"
                        if INSPECTION_FILES_URL else ""),
-            "substitution": {"user1": {"type": "mention", "mentionee": {"type": "all"}}},
+            "substitution": {"user1": {"type": "mention", "mentionee": (
+                {"type": "user", "userId": mention_user_id} if mention_user_id else {"type": "all"})}},
         },
     ]
     resp = requests.post(
@@ -628,20 +661,14 @@ def handle_text(event):
         if "|" in text:
             parsed_items = parse_inspection_paste(text)
             if parsed_items:
-                alt_text, contents = build_inspection_carousel_flex(parsed_items)
-                lead_alt_text, lead_contents = build_inspection_announce_flex(len(parsed_items), peek_batch_code())
                 save_inspection_preview(user_id, parsed_items)
-                reply_text_flex_text(
-                    event.reply_token,
-                    lead_alt_text, lead_contents,
-                    alt_text, contents,
-                    'ถ้าข้อมูลถูกต้อง พิมพ์ "ส่ง" เพื่อโพสต์เข้ากลุ่ม หรือ "ยกเลิก" เพื่อยกเลิกครับ'
-                )
+                reply_inspection_preview(event.reply_token, parsed_items)
             else:
                 reply(event.reply_token,
                       'รูปแบบไม่ถูกต้องครับ แต่ละบรรทัดต้องมีอย่างน้อย 4 ช่องคั่นด้วย "|" คือ '
                       'code|เลขที่เอกสาร|เรื่อง|วันที่ เช่น\n'
-                      'AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026')
+                      'AR-329|RIH-QA-0123|ขออนุมัติวัสดุ Shop Drawing|23/10/2026\n\n'
+                      'เอกสารรับมอบพื้นที่ (Assignee): เติม "A|" หน้าบรรทัด หรือขึ้นบรรทัดแรกด้วย "#ASSIGNEE"')
             return
 
         manual_answer = handle_manual_answer(user_id, text)
@@ -744,6 +771,14 @@ def handle_text(event):
                 app.logger.exception("could not notify owner")
         return
 
+    # set the CO tagged on Assignee (area handover) lists (owner only, reply 1:1)
+    if text.startswith("ตั้งผู้รับผิดชอบ"):
+        try:
+            handle_set_co_command(event, group_id, text)
+        except Exception:
+            app.logger.exception("set CO failed")
+        return
+
     # set a buddy team (owner only; confirmation goes to the owner's 1:1 chat)
     if text.startswith("ตั้งบัดดี้"):
         try:
@@ -837,6 +872,27 @@ def split_source_tag(parts):
         return parts[-1].strip().upper(), parts[:-1]
     return "", parts
 
+# Site Around role a document came from. "I" = Inspector (request to inspect -
+# the urgent one), "A" = Assignee (area handover, waiting for photos to be
+# attached; only the CO is tagged). A paste marks Assignee lines either with a
+# header line ("#A" / "#ASSIGNEE" / "รับมอบพื้นที่") that applies to the lines
+# below it, or with a leading "A|" field on the line itself. Unmarked = Inspector.
+ROLE_INSPECTOR, ROLE_ASSIGNEE = "I", "A"
+ROLE_HEADERS = {
+    "#A": ROLE_ASSIGNEE, "#ASSIGNEE": ROLE_ASSIGNEE, "ASSIGNEE": ROLE_ASSIGNEE,
+    "รับมอบพื้นที่": ROLE_ASSIGNEE, "#รับมอบพื้นที่": ROLE_ASSIGNEE,
+    "#I": ROLE_INSPECTOR, "#INSPECTOR": ROLE_INSPECTOR, "INSPECTOR": ROLE_INSPECTOR,
+}
+
+def role_header(line):
+    """Role for a header line (no "|"), e.g. "#ASSIGNEE" or "assignee pb"; else None."""
+    words = line.strip().upper().split()
+    if not words:
+        return None
+    if len(words) > 1 and words[-1] not in SOURCE_TAGS:
+        return None
+    return ROLE_HEADERS.get(words[0])
+
 def parse_inspection_paste(text):
     """Parses pasted lines of 4+ pipe-separated fields per document:
     code|doc_number|subject|date[|extra date/notes...], e.g.:
@@ -857,8 +913,15 @@ def parse_inspection_paste(text):
     if not lines or not any("|" in ln for ln in lines):
         return None
     items = []
+    current_role = ROLE_INSPECTOR
     for ln in lines:
+        if "|" not in ln and role_header(ln):
+            current_role = role_header(ln)
+            continue
         parts = [p.strip() for p in ln.split("|")]
+        role = current_role
+        if len(parts) >= 5 and parts[0].upper() in (ROLE_INSPECTOR, ROLE_ASSIGNEE):
+            role, parts = parts[0].upper(), parts[1:]
         if len(parts) < 4:
             return None
         source, parts = split_source_tag(parts)
@@ -870,9 +933,41 @@ def parse_inspection_paste(text):
             return None
         items.append({
             "code": code, "doc_number": doc_number, "subject": subject,
-            "date": date_str, "extra_note": extra_note, "source": source,
+            "date": date_str, "extra_note": extra_note, "source": source, "role": role,
         })
-    return items
+    return items or None
+
+def item_role(it):
+    return it.get("role") or ROLE_INSPECTOR
+
+def split_items_by_role(items):
+    """[(role, items)] - Inspector first (more urgent), only roles present."""
+    out = []
+    for role in (ROLE_INSPECTOR, ROLE_ASSIGNEE):
+        group = [it for it in items if item_role(it) == role]
+        if group:
+            out.append((role, group))
+    return out
+
+def items_source_label(items):
+    """"STI" when every item is tagged STI, else "PB" (the usual creator)."""
+    sources = {it.get("source") for it in items if it.get("source")}
+    return sources.pop() if len(sources) == 1 else "PB"
+
+# Colors per role: Inspector is the urgent one -> warm orange/red stripe;
+# Assignee (area handover) -> calmer blue.
+ROLE_THEME = {
+    ROLE_INSPECTOR: {
+        "stripe": "#D84315", "highlight": "#D84315", "separator": "#BF360C",
+        "badge_bg": "#FFF8E7", "badge_border": "#F5DDB5",
+        "badge_label": "#7A2E12", "badge_value": "#C2571A",
+    },
+    ROLE_ASSIGNEE: {
+        "stripe": "#1565C0", "highlight": "#1565C0", "separator": "#0D47A1",
+        "badge_bg": "#E3F2FD", "badge_border": "#BBDEFB",
+        "badge_label": "#0D47A1", "badge_value": "#1565C0",
+    },
+}
 
 INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR = "#1565C0"  # the "จำนวน N ฉบับ" count phrase
 
@@ -884,42 +979,66 @@ def batch_day_key(now=None):
     now = now or bkk_now()
     return f"{now.day:02d}{now.month:02d}{(now.year + 543) % 100:02d}"
 
-def peek_batch_code():
+# Assignee (area handover) announcements get their own round code and sequence,
+# e.g. AS-291069-1, so they never mix with the Inspector PB-291069-n codes.
+ASSIGNEE_BATCH_PREFIX = os.environ.get("ASSIGNEE_BATCH_PREFIX", "AS").strip().upper()
+
+def _batch_prefix_and_key(role):
+    if role == ROLE_ASSIGNEE:
+        return ASSIGNEE_BATCH_PREFIX, f"batch_seq_{ASSIGNEE_BATCH_PREFIX}_{batch_day_key()}"
+    return BATCH_PREFIX, f"batch_seq_{batch_day_key()}"
+
+def peek_batch_code(role=ROLE_INSPECTOR):
     """Code the next "ส่ง" will get (for the preview; not reserved)."""
-    key = batch_day_key()
-    n = int(get_setting(f"batch_seq_{key}", "0") or 0) + 1
-    return f"{BATCH_PREFIX}-{key}-{n}"
+    prefix, key = _batch_prefix_and_key(role)
+    n = int(get_setting(key, "0") or 0) + 1
+    return f"{prefix}-{batch_day_key()}-{n}"
 
-def next_batch_code():
-    key = batch_day_key()
-    n = int(get_setting(f"batch_seq_{key}", "0") or 0) + 1
-    set_setting(f"batch_seq_{key}", str(n))
-    return f"{BATCH_PREFIX}-{key}-{n}"
+def next_batch_code(role=ROLE_INSPECTOR):
+    prefix, key = _batch_prefix_and_key(role)
+    n = int(get_setting(key, "0") or 0) + 1
+    set_setting(key, str(n))
+    return f"{prefix}-{batch_day_key()}-{n}"
 
-def build_inspection_announce_flex(n, batch_code=None):
+def build_inspection_announce_flex(n, batch_code=None, role=ROLE_INSPECTOR, source_label="PB"):
     """A single-line Flex bubble (not a plain TextMessage) so the "จำนวน N
     ฉบับ" count phrase can be colored - LINE's plain text messages have no
-    per-span styling, only Flex text components do."""
+    per-span styling, only Flex text components do. A colored stripe on the
+    left tells Inspector (urgent, orange-red) and Assignee (blue) apart."""
+    theme = ROLE_THEME[role]
+    if role == ROLE_ASSIGNEE:
+        spans = [
+            {"type": "span", "text": f"🏗️ แจ้งรายการเอกสารรับมอบพื้นที่จาก {source_label} "},
+            {"type": "span", "text": f"จำนวน {n} ฉบับ", "color": theme["highlight"], "weight": "bold"},
+        ]
+        code_label = "🔖 รหัสแจ้ง  "
+        alt_body = f"แจ้งรายการเอกสารรับมอบพื้นที่จาก {source_label} จำนวน {n} ฉบับ"
+    else:
+        spans = [
+            {"type": "span", "text": "📋✨ แจ้งข้อมูลเอกสาร Request จาก บมจ.พรีบิลท์ (PB) "},
+            {"type": "span", "text": f"จำนวน {n} ฉบับ", "color": theme["highlight"], "weight": "bold"},
+            {"type": "span", "text": " ดังนี้ค่ะ 📑"},
+        ]
+        code_label = "🔖 รหัสรอบแจ้ง  "
+        alt_body = f"แจ้งข้อมูลเอกสาร Request จาก PB จำนวน {n} ฉบับ"
+    text_col = [{"type": "text", "wrap": True, "contents": spans}] + ([{
+        "type": "text", "wrap": True, "margin": "md", "size": "sm", "contents": [
+            {"type": "span", "text": code_label, "color": "#888888"},
+            {"type": "span", "text": batch_code, "weight": "bold", "color": BATCH_COLOR},
+        ]
+    }] if batch_code else [])
     contents = {
         "type": "bubble",
         "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "lg",
-            "contents": [{
-                "type": "text", "wrap": True, "contents": [
-                    {"type": "span", "text": "📋✨ แจ้งข้อมูลเอกสาร Request จาก บมจ.พรีบิลท์ (PB) "},
-                    {"type": "span", "text": f"จำนวน {n} ฉบับ",
-                     "color": INSPECTION_ANNOUNCE_HIGHLIGHT_COLOR, "weight": "bold"},
-                    {"type": "span", "text": " ดังนี้ค่ะ 📑"},
-                ]
-            }] + ([{
-                "type": "text", "wrap": True, "margin": "md", "size": "sm", "contents": [
-                    {"type": "span", "text": "🔖 รหัสรอบแจ้ง  ", "color": "#888888"},
-                    {"type": "span", "text": batch_code, "weight": "bold", "color": BATCH_COLOR},
-                ]
-            }] if batch_code else [])
+            "type": "box", "layout": "horizontal", "paddingAll": "lg", "spacing": "md",
+            "contents": [
+                {"type": "box", "layout": "vertical", "width": "6px", "cornerRadius": "3px",
+                 "backgroundColor": theme["stripe"], "contents": [{"type": "filler"}]},
+                {"type": "box", "layout": "vertical", "flex": 1, "contents": text_col},
+            ]
         }
     }
-    alt_text = (f"[{batch_code}] " if batch_code else "") + f"แจ้งข้อมูลเอกสาร Request จาก PB จำนวน {n} ฉบับ"
+    alt_text = (f"[{batch_code}] " if batch_code else "") + alt_body
     return alt_text, contents
 
 def save_inspection_preview(user_id, items):
@@ -965,7 +1084,12 @@ INSPECTION_BUBBLE_MAX_BYTES = 28000  # LINE's per-bubble cap is 30 KB; keep some
 # a push/reply carries at most 5 messages: lead + document bubbles + closing message
 INSPECTION_MAX_BUBBLES = 3
 
-def build_inspection_carousel_flex(items):
+def days_pending_since(date_str):
+    """Whole days from the date the doc entered Site Around until today, or None."""
+    d = _parse_thai_or_iso_date(date_str)
+    return max((bkk_today() - d).days, 0) if d else None
+
+def build_inspection_carousel_flex(items, role=ROLE_INSPECTOR):
     """A SINGLE bubble listing every document stacked vertically, one block
     per document (separated by a divider line), each block's own fields
     also stacked vertically as an emoji + label line followed by the value,
@@ -974,6 +1098,7 @@ def build_inspection_carousel_flex(items):
     top-to-bottom in a single scroll instead of needing to swipe sideways
     between documents."""
     txt = flex_txt
+    theme = ROLE_THEME[role]
 
     def field(emoji, label, value, color, bold=False):
         return {
@@ -989,11 +1114,11 @@ def build_inspection_carousel_flex(items):
         instead of the plain field() layout, to stand out as the key value."""
         return {
             "type": "box", "layout": "vertical", "margin": "md", "spacing": "xs",
-            "backgroundColor": INSPECTION_DOCNUM_BG_COLOR, "cornerRadius": "md", "paddingAll": "md",
-            "borderWidth": "1px", "borderColor": INSPECTION_DOCNUM_BORDER_COLOR,
+            "backgroundColor": theme["badge_bg"], "cornerRadius": "md", "paddingAll": "md",
+            "borderWidth": "1px", "borderColor": theme["badge_border"],
             "contents": [
-                txt("📌 เลขที่เอกสาร", size="xs", color=INSPECTION_DOCNUM_LABEL_COLOR, weight="bold"),
-                txt(value, size="lg", color=INSPECTION_DOCNUM_COLOR, wrap=True, weight="bold"),
+                txt("📌 เลขที่เอกสาร", size="xs", color=theme["badge_label"], weight="bold"),
+                txt(value, size="lg", color=theme["badge_value"], wrap=True, weight="bold"),
             ]
         }
 
@@ -1007,7 +1132,15 @@ def build_inspection_carousel_flex(items):
         body.append(field("🔖", "Code", it["doc_number"], INSPECTION_VALUE_COLOR))
         body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_VALUE_COLOR))
         body.append(field("📅", "วันที่ส่งเอกสารเข้าระบบ", it["date"], INSPECTION_VALUE_COLOR))
-        if it.get("extra_note"):
+        if role == ROLE_ASSIGNEE:
+            days = days_pending_since(it["date"])
+            if days is None:
+                pending_txt, pending_color = "-", INSPECTION_EXTRA_NOTE_COLOR
+            else:
+                pending_txt = "เข้าระบบวันนี้" if days == 0 else f"ค้าง {days} วัน"
+                pending_color = OVERDUE_COLOR if days >= REMIND_LATE_DAYS else INSPECTION_EXTRA_NOTE_COLOR
+            body.append(field("📷", "รอแนบรูป / จำนวนวันที่ค้าง", pending_txt, pending_color, bold=True))
+        elif it.get("extra_note"):
             body.append(field("🧱", "วันที่เทคอนกรีต/ก่อ/ฉาบ/อื่นๆ", it["extra_note"],
                                INSPECTION_EXTRA_NOTE_COLOR))
         reply_link = doc_reply_liff_url(it["code"])
@@ -1034,7 +1167,7 @@ def build_inspection_carousel_flex(items):
         body = []
         for i, b in enumerate(blocks):
             if i > 0:
-                body.append({"type": "separator", "margin": "xl", "color": INSPECTION_SEPARATOR_COLOR})
+                body.append({"type": "separator", "margin": "xl", "color": theme["separator"]})
             body.extend(b)
         return {"type": "bubble",
                 "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body, "paddingAll": "lg"}}
@@ -1057,7 +1190,8 @@ def build_inspection_carousel_flex(items):
             txt("… รายการยาวเกินกว่าที่ LINE ส่งได้ในครั้งเดียว กรุณาแบ่งส่งเป็นสองรอบ",
                 size="xs", color=OVERDUE_COLOR, margin="md"))
 
-    alt_text = f"เอกสารตรวจสอบ {len(items)} รายการ"
+    alt_text = (f"เอกสารรับมอบพื้นที่ {len(items)} รายการ" if role == ROLE_ASSIGNEE
+                else f"เอกสารตรวจสอบ {len(items)} รายการ")
     return alt_text, bubbles
 
 def handle_inspection_confirm(user_id):
@@ -1068,35 +1202,104 @@ def handle_inspection_confirm(user_id):
     if not target:
         return ('ยังไม่ได้ตั้งกลุ่มปลายทางครับ ให้พิมพ์ "ตั้งกลุ่มแจ้งเอกสาร" ในกลุ่มที่ต้องการให้โพสต์ '
                 'แล้วกลับมาพิมพ์ "ส่ง" อีกครั้ง (รายการยังรออยู่)')
-    alt_text, contents = build_inspection_carousel_flex(items)
-    try:
-        batch_code = next_batch_code()
-    except Exception:
-        app.logger.exception("could not allocate batch code")
-        batch_code = None
-    lead_alt_text, lead_contents = build_inspection_announce_flex(len(items), batch_code)
-    try:
-        push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents,
-                                  batch_code=batch_code, doc_codes=[it["code"] for it in items])
-    except Exception as e:
-        app.logger.exception("inspection push failed")
-        detail = ""
-        resp = getattr(e, "response", None)
-        if resp is not None:
-            detail = f"\n(LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})"
-        return ("โพสต์เข้ากลุ่มไม่สำเร็จครับ ลองใหม่อีกครั้ง หรือพิมพ์ \"ตั้งกลุ่มแจ้งเอกสาร\" "
-                "ในกลุ่มที่ต้องการก่อน" + detail)
-    clear_inspection_preview(user_id)
-    try:
-        save_inspection_docs(items, target, batch_code)
-    except Exception:
-        app.logger.exception("could not record posted inspection docs for replies")
+    results, remaining = [], []
+    for role, group in split_items_by_role(items):
+        ok, line = post_role_list(target, role, group)
+        results.append(line)
+        if not ok:
+            remaining.extend(group)
+    if remaining:
+        save_inspection_preview(user_id, remaining)
+    else:
+        clear_inspection_preview(user_id)
     try:
         set_setting("last_inspection_post_group_id", target)
     except Exception:
         app.logger.exception("could not record last inspection post group")
-    return (f"โพสต์เข้ากลุ่ม \"{get_group_name(target)}\" เรียบร้อยแล้วครับ"
-            + (f"\n🔖 รหัสรอบแจ้ง: {batch_code} (พิมพ์รหัสนี้ในช่องค้นหาของกลุ่มเพื่อหาย้อนหลัง)" if batch_code else ""))
+    msg = f"กลุ่ม \"{get_group_name(target)}\"\n" + "\n".join(results)
+    if remaining:
+        msg += '\n\nชุดที่ส่งไม่สำเร็จยังรออยู่ พิมพ์ "ส่ง" อีกครั้งเพื่อลองใหม่ หรือ "ยกเลิก"'
+    else:
+        msg += "\n(พิมพ์รหัสในช่องค้นหาของกลุ่มเพื่อหาย้อนหลัง)"
+    return msg
+
+ASSIGNEE_MENTION_TEXT = os.environ.get(
+    "ASSIGNEE_MENTION_TEXT",
+    "โปรดตรวจสอบและแนบรูปรับมอบพื้นที่ ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ",
+)
+
+def post_role_list(target, role, items):
+    """Posts one role's list (lead + cards + mention) to the group.
+    Returns (ok, Thai status line)."""
+    alt_text, contents = build_inspection_carousel_flex(items, role)
+    try:
+        batch_code = next_batch_code(role)
+    except Exception:
+        app.logger.exception("could not allocate batch code")
+        batch_code = None
+    lead_alt_text, lead_contents = build_inspection_announce_flex(
+        len(items), batch_code, role, items_source_label(items))
+    kwargs = {}
+    note = ""
+    if role == ROLE_ASSIGNEE:
+        co = get_assignee_co()
+        if co:
+            kwargs = {"mention_user_id": co["user_id"], "mention_text": ASSIGNEE_MENTION_TEXT}
+        else:
+            kwargs = {"mention_text": ASSIGNEE_MENTION_TEXT}
+            note = ' ⚠️ ยังไม่ได้ตั้ง CO เลยแท็ก @All แทน (ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ")'
+    label = "รับมอบพื้นที่ (Assignee)" if role == ROLE_ASSIGNEE else "Request (Inspector)"
+    try:
+        push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents,
+                                  batch_code=batch_code, doc_codes=[it["code"] for it in items], **kwargs)
+    except Exception as e:
+        app.logger.exception("inspection push failed")
+        resp = getattr(e, "response", None)
+        detail = f" (LINE ตอบกลับ {resp.status_code}: {resp.text[:200]})" if resp is not None else ""
+        return False, f"❌ {label} {len(items)} ฉบับ: โพสต์ไม่สำเร็จ{detail}"
+    try:
+        save_inspection_docs(items, target, batch_code)
+    except Exception:
+        app.logger.exception("could not record posted inspection docs for replies")
+    return True, f"✅ {label} {len(items)} ฉบับ" + (f" · 🔖 {batch_code}" if batch_code else "") + note
+
+# --- CO: the one person tagged on Assignee (area handover) lists ---
+# Set in the group by the owner: "ตั้งผู้รับผิดชอบ CO @ชื่อ" (confirmation 1:1).
+def get_assignee_co():
+    uid = get_setting("assignee_co_user_id", "")
+    if not uid:
+        return None
+    return {"user_id": uid, "name": get_setting("assignee_co_name", ""),
+            "group_id": get_setting("assignee_co_group_id", "")}
+
+def handle_set_co_command(event, group_id, text):
+    sender_id = event.source.user_id
+    allowed = {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
+    if sender_id not in allowed:
+        return
+    mention = getattr(event.message, "mention", None)
+    mentionees = [m for m in (mention.mentionees if mention and mention.mentionees else [])
+                  if getattr(m, "type", "user") == "user"]
+    if len(mentionees) != 1:
+        push_to(sender_id, "ตั้ง CO ไม่สำเร็จครับ ต้อง @ ชื่อ 1 คนพอดี\n"
+                           "รูปแบบ: ตั้งผู้รับผิดชอบ CO @ชื่อ (เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา)")
+        return
+    m = mentionees[0]
+    raw_name = ""
+    if getattr(m, "index", None) is not None and getattr(m, "length", None) is not None:
+        raw_name = text[utf16_index_to_py(text, m.index):utf16_index_to_py(text, m.index + m.length)]
+    uid = getattr(m, "user_id", None) or find_group_member_by_name(group_id, raw_name)
+    if not uid:
+        push_to(sender_id, f"บอทยังไม่รู้จัก {raw_name.strip() or 'คนที่ @'} ครับ\n"
+                           "→ ให้คนนั้นพิมพ์ข้อความอะไรก็ได้ในกลุ่ม 1 ครั้ง แล้วส่งคำสั่งใหม่ (ไม่ต้องแอดบอทเป็นเพื่อน)")
+        return
+    name = get_profile_name(group_id, uid) or raw_name.lstrip("@").strip()
+    set_setting("assignee_co_user_id", uid)
+    set_setting("assignee_co_name", name)
+    set_setting("assignee_co_group_id", group_id)
+    push_to(sender_id, f"✅ ตั้ง CO = {name} แล้วครับ\n"
+                       "เอกสารรับมอบพื้นที่ (Assignee) จะแท็กเฉพาะคนนี้ ทั้งตอนแจ้งและตอนติดตามรายวัน\n"
+                       "กดยกเลิกข้อความคำสั่งในกลุ่มได้เลย")
 
 WRONG_GROUP_APOLOGY = ("🙏 ขออภัยค่ะ รายการแจ้งเอกสาร Request ด้านบนส่งผิดกลุ่ม "
                        "รบกวนไม่ต้องดำเนินการค่ะ ขอบคุณค่ะ")
@@ -1161,13 +1364,14 @@ def save_inspection_docs(items, group_id, batch_code=None):
         for it in items:
             code = normalize_doc_code(it["code"]) or it["code"].strip().upper()
             rows.append((code, it["doc_number"], it["subject"], it["date"],
-                         it.get("extra_note", ""), group_id, now_iso, batch_code, it.get("source", "")))
+                         it.get("extra_note", ""), group_id, now_iso, batch_code, it.get("source", ""),
+                         item_role(it)))
         conn.executemany(
-            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, batch_code, source) "
-            "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
+            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, batch_code, source, role) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
             "doc_number = excluded.doc_number, subject = excluded.subject, date = excluded.date, "
             "extra_note = excluded.extra_note, group_id = excluded.group_id, posted_at = excluded.posted_at, "
-            "batch_code = excluded.batch_code, source = excluded.source",
+            "batch_code = excluded.batch_code, source = excluded.source, role = excluded.role",
             rows,
         )
         if batch_code:
@@ -1268,10 +1472,10 @@ def handle_track_backfill(text):
                 (reopened if row[0] else kept).append(code)
             else:
                 conn.execute(
-                    "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, source) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, source, role) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
                     (code, it["doc_number"], it["subject"], it["date"], it.get("extra_note", ""),
-                     group_id, posted_iso, it.get("source", "")))
+                     group_id, posted_iso, it.get("source", ""), item_role(it)))
                 added.append(code)
         for ref in head_refs:
             code = normalize_doc_code(ref)
@@ -1597,7 +1801,7 @@ def get_docs_status(days):
     conn = db()
     try:
         docs = conn.execute(
-            "SELECT code, subject, date, posted_at, group_id, closed_at, batch_code FROM inspection_docs "
+            "SELECT code, subject, date, posted_at, group_id, closed_at, batch_code, role FROM inspection_docs "
             "WHERE posted_at >= ? ORDER BY posted_at, code", (since,)).fetchall()
         replies = conn.execute(
             "SELECT r.code, r.user_id, r.user_name, r.text FROM doc_replies r "
@@ -1618,9 +1822,11 @@ def get_docs_status(days):
         info["latest"] = f"{name}: {text}"
     teams = load_buddy_teams()
     out = []
-    for code, subject, date, posted_at, group_id, closed_at, batch_code in docs:
+    for code, subject, date, posted_at, group_id, closed_at, batch_code, role in docs:
         info = by_code.get(code, {"ids": set(), "n": 0, "latest": None})
-        status = doc_team_status(code, subject, teams, info["ids"])
+        role = role or ROLE_INSPECTOR
+        # Assignee (area handover) docs are the CO's alone - no buddy-team systems
+        status = None if role == ROLE_ASSIGNEE else doc_team_status(code, subject, teams, info["ids"])
         if closed_at:
             pending = False
         elif status is None:
@@ -1629,7 +1835,7 @@ def get_docs_status(days):
             pending = not all(s["done"] for s in status)
         out.append({"code": code, "subject": subject, "date": date, "posted_at": posted_at,
                     "group_id": group_id or "", "closed": bool(closed_at), "status": status,
-                    "batch_code": batch_code or "",
+                    "batch_code": batch_code or "", "role": role,
                     "n": info["n"], "latest": info["latest"], "pending": pending})
     return out
 
@@ -1971,11 +2177,14 @@ def handle_set_buddy_command(event, group_id, text):
     push_to(sender_id, msg)
 
 def build_buddy_list_text():
+    co = get_assignee_co()
+    co_line = (f"🏗️ CO (เอกสารรับมอบพื้นที่ / Assignee): {co['name'] or co['user_id']}" if co
+               else '🏗️ CO (เอกสารรับมอบพื้นที่ / Assignee): ยังไม่ได้ตั้ง — ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ"')
     teams = load_buddy_teams()
     if not teams:
-        return ('ยังไม่ได้ตั้งบัดดี้ครับ ตั้งในกลุ่มด้วย:\nตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
+        return (co_line + '\n\nยังไม่ได้ตั้งบัดดี้ครับ ตั้งในกลุ่มด้วย:\nตั้งบัดดี้ AR,ST EE-A @ชื่อ1 @ชื่อ2\n'
                 '(เลือกชื่อจากรายชื่อที่ LINE เด้งขึ้นมา)')
-    lines = ["👥 บัดดี้ผู้รับผิดชอบตอบเอกสาร"]
+    lines = [co_line, "", "👥 บัดดี้ผู้รับผิดชอบตอบเอกสาร (Inspector)"]
     for t in teams:
         names = ", ".join(get_profile_name(t["group_id"], u) for u in t["members"])
         lines.append(f"• {t['label']} ({', '.join(sorted(t['prefixes']))}): {names}")
@@ -2191,6 +2400,8 @@ def _days_waiting(posted_at):
         return 0
     return max((bkk_today() - posted).days, 0)
 
+CO_ROW_LABEL = "CO (รับมอบพื้นที่ · รอแนบรูป)"
+
 def followup_tag_plan(docs):
     """Per-team breakdown of who still owes which document.
     Returns (rows, all_codes):
@@ -2202,8 +2413,14 @@ def followup_tag_plan(docs):
     A team that already answered a doc never gets that doc on its line."""
     teams = {t["label"]: t for t in load_buddy_teams()}
     rows, all_codes = {}, []
+    co = get_assignee_co()
     for d in docs:
         code = d["code"]
+        if d.get("role") == ROLE_ASSIGNEE and co:
+            row = rows.setdefault(CO_ROW_LABEL, {"label": CO_ROW_LABEL, "member_ids": [co["user_id"]], "codes": []})
+            if all(c != code for c, _ in row["codes"]):
+                row["codes"].append((code, False))
+            continue
         if d["status"] is None:
             if code not in all_codes:
                 all_codes.append(code)
