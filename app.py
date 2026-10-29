@@ -432,6 +432,14 @@ def reply(reply_token, text):
             messages=[TextMessage(text=text)]
         ))
 
+def reply_texts(reply_token, texts):
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[TextMessage(text=t) for t in texts[:5]]
+        ))
+
 def push_to(user_id, text):
     if not user_id:
         return
@@ -663,6 +671,9 @@ def handle_text(event):
                 reply(event.reply_token, alt_text)
             else:
                 reply_flex(event.reply_token, alt_text, contents)
+        elif text.split(" ", 1)[0] in SYSTEM_SUMMARY_CMDS:
+            reply_texts(event.reply_token,
+                        build_system_summary_texts(text.split(" ", 1)[1] if " " in text else ""))
         elif text in ("ติดตาม", "ติดตามคำตอบ"):
             alt_text, contents, who = build_followup_preview()
             if contents is None:
@@ -1625,6 +1636,140 @@ def get_docs_status(days):
 def team_status_line(status):
     return "   ".join(f"{'✅' if s['done'] else '⏳'} {s['label']}" for s in status)
 
+# --- Per-system answer summary (1:1 "สรุประบบ") ---
+#   สรุประบบ            -> one message per system (EE, AC, SN/FP)
+#   สรุประบบ SN/FP      -> just that system ("EE" covers EE-A + EE-B together)
+#   สรุประบบ EE 30      -> optional look-back window in days
+# Each message: when the data was pulled, then "ตอบแล้ว" (date the bot posted
+# the doc in LINE · code · the team's answer) followed by "ยังไม่ได้ตอบ"
+# (date · code · subject), both sorted by document number, smallest first.
+THAI_MONTHS_SHORT = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+                     "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+SYSTEM_SUMMARY_CMDS = ("สรุประบบ", "สรุปคำตอบ")
+SYSTEM_SUMMARY_SUBJECT_MAX = 45
+
+def thai_short_date(iso_or_dt, with_time=False):
+    try:
+        dt = iso_or_dt if isinstance(iso_or_dt, datetime.datetime) else datetime.datetime.fromisoformat(iso_or_dt)
+    except (ValueError, TypeError):
+        return "-"
+    out = f"{dt.day} {THAI_MONTHS_SHORT[dt.month - 1]} {(dt.year + 543) % 100:02d}"
+    return out + (f" {dt:%H:%M} น." if with_time else "")
+
+def _doc_number_sort_key(code, doc_number):
+    digits = re.sub(r"\D", "", (doc_number or "").split("-")[-1])
+    num = int(code.split("-")[1]) if code.count("-") == 1 and code.split("-")[1].isdigit() else 0
+    return (0, int(digits), code) if digits else (1, doc_prefix(code), num)
+
+def build_system_summary_texts(arg=""):
+    """Returns a list of text messages (max 5), one per system."""
+    tokens = [t for t in (arg or "").split() if t]
+    days = REMIND_WINDOW_DAYS
+    wanted = None
+    for t in tokens:
+        if t.isdigit():
+            days = max(1, min(int(t), 90))
+        else:
+            wanted = t.upper().replace("&", "/")
+    teams = load_buddy_teams()
+    systems = []
+    for req in REQUIRED_SYSTEMS.values():  # EE, AC, SN/FP order first
+        for s in req:
+            if s not in systems:
+                systems.append(s)
+    for t in teams:
+        if t["system"] not in systems:
+            systems.append(t["system"])
+    if wanted:
+        wanted = team_system(wanted)[0]  # "EE-A" -> "EE"
+        if wanted not in systems:
+            return [f"ไม่พบระบบ {wanted} ครับ มีระบบ: {', '.join(systems) or '-'}\n"
+                    f"ตัวอย่าง: \"สรุประบบ SN/FP\" หรือ \"สรุประบบ\" (ทุกระบบ)"]
+        systems = [wanted]
+    if not systems:
+        return ["ยังไม่ได้ตั้งบัดดี้ระบบใดครับ (พิมพ์ \"บัดดี้\" เพื่อดู)"]
+
+    docs = get_docs_status(days)
+    conn = db()
+    try:
+        num_rows = conn.execute("SELECT code, doc_number FROM inspection_docs").fetchall()
+        reply_rows = conn.execute(
+            "SELECT code, user_id, user_name, text FROM doc_replies ORDER BY created_at, id").fetchall()
+    finally:
+        conn.close()
+    doc_numbers = {c: n for c, n in num_rows}
+    try:
+        name_map = load_member_name_map()
+    except Exception:
+        name_map = {}
+    replies_by_code = {}
+    for code, uid, name, text in reply_rows:
+        replies_by_code.setdefault(code, []).append((reply_identity_ids(uid, name, name_map), uid, text))
+
+    now = bkk_now()
+    messages = []
+    for system in systems:
+        sys_teams = [t for t in teams if t["system"] == system]
+        members = {u for t in sys_teams for u in t["members"]}
+        markers = {team_marker(t["label"]) for t in sys_teams}
+        answered, waiting = [], []
+        for d in docs:
+            sts = [s for s in (d["status"] or [])
+                   if (s["teams"] and team_system(s["teams"][0])[0] == system)
+                   or (s.get("missing") and s["label"].startswith(system + " "))]
+            if not sts:
+                continue  # this system isn't responsible for the doc
+            done = all(s["done"] for s in sts)
+            texts = []
+            for ids, uid, text in replies_by_code.get(d["code"], []):
+                if uid in markers or (ids & members):
+                    t = " ".join((text or "").split())
+                    if t and t not in texts:
+                        texts.append(t)
+            row = {"code": d["code"], "posted": thai_short_date(d["posted_at"]),
+                   "key": _doc_number_sort_key(d["code"], doc_numbers.get(d["code"])),
+                   "subject": d["subject"] or "-", "texts": texts}
+            if done:
+                answered.append(row)
+            elif d["closed"]:
+                row["texts"] = texts or ["🔒 ปิดเอกสารโดยแอดมิน"]
+                answered.append(row)
+            else:
+                waiting.append(row)
+        answered.sort(key=lambda r: r["key"])
+        waiting.sort(key=lambda r: r["key"])
+        label = system + (" (A+B)" if len(sys_teams) > 1 else "")
+        total = len(answered) + len(waiting)
+        lines = [f"📋 สรุปคำตอบระบบ {label}",
+                 f"🔎 ข้อมูล ณ {thai_short_date(now, with_time=True)}",
+                 f"📅 เอกสารที่บอทแจ้งใน {days} วันล่าสุด · {total} ฉบับ",
+                 "━━━━━━━━━━━━━━━",
+                 "",
+                 f"✅ {system} ตอบแล้ว ({len(answered)} ฉบับ)",
+                 ""]
+        if not answered:
+            lines.append("   — ยังไม่มี —")
+        for r in answered:
+            ans = " / ".join(r["texts"]) or "ตอบแล้ว"
+            lines.append(f"{r['posted']} │ {r['code']} │ {ans}")
+        lines += ["", "━━━━━━━━━━━━━━━", "",
+                  f"⏳ {system} ยังไม่ได้ตอบ ({len(waiting)} ฉบับ)", ""]
+        if not waiting:
+            lines.append("   — ตอบครบทุกฉบับแล้ว 🎉 —")
+        for r in waiting:
+            subj = r["subject"]
+            if len(subj) > SYSTEM_SUMMARY_SUBJECT_MAX:
+                subj = subj[:SYSTEM_SUMMARY_SUBJECT_MAX].rstrip() + "…"
+            lines.append(f"{r['posted']} │ {r['code']} │ {subj}")
+        lines += ["", "(วันที่หน้ารายการ = วันที่บอทแจ้งเอกสารในไลน์ · เรียงตามเลขที่เอกสาร)"]
+        text = "\n".join(lines)
+        if len(text) > 4900:
+            text = text[:4880] + "\n…(ยาวเกิน แสดงไม่ครบ)"
+        messages.append(text)
+    if len(messages) > 5:  # LINE allows 5 messages per reply
+        messages = messages[:4] + ["\n\n".join(messages[4:])[:4900]]
+    return messages
+
 BATCH_LIST_DAYS = 3
 
 def handle_batch_lookup(arg):
@@ -1676,6 +1821,8 @@ FOLLOWUP_HELP_TEXT = (
     "   ช่วงเลข: AC,SN/FP ตอบแล้ว AR-325 ถึง ST-802\n\n"
     "③ ปิดทั้งฉบับ (ไม่ติดตามอีก ทุกทีม)\n"
     "   ปิดเอกสาร AR-338 ST-805\n\n"
+    "📋 สรุปคำตอบแยกระบบ: \"สรุประบบ\" (ทุกระบบ) · \"สรุประบบ SN/FP\" · \"สรุประบบ EE\" (รวม A+B) · "
+    "ย้อนหลังกี่วัน: \"สรุประบบ EE 30\"\n\n"
     "📚 สารบัญรอบแจ้ง: \"สารบัญสัปดาห์\" / \"สารบัญสัปดาห์ก่อน\" (ก็อปไปวางใน Note) · \"รอบ\"\n\n"
     "↩️ ยกเลิก: \"AC ยกเลิกตอบแล้ว ST-803\" · \"เปิดเอกสาร AR-338\"\n"
     "ใช้เลขที่เอกสารแทนรหัสได้ เช่น RIH-I02330 หรือ I02330 · คั่นหลายเลขด้วยเว้นวรรคหรือ ,"
