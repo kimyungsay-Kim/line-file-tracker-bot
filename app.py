@@ -1167,6 +1167,36 @@ def _parse_thai_or_iso_date(raw):
         return d
     return None
 
+def _parse_backfill_body(body):
+    """Lenient parse for "ติดตามย้อนหลัง": pipe lines become docs (subject and
+    date may be cut short), plain lines are codes, and "..." placeholder lines
+    are ignored. A line that doesn't start with a code continues the previous
+    pipe line (LINE sometimes breaks long lines when copying)."""
+    merged = []
+    for ln in body:
+        t = ln.strip()
+        if not t or re.fullmatch(r"[.\u2026\s]+", t):
+            continue
+        if merged and "|" in merged[-1] and not CODE_LINE_RE.match(t) \
+                and (merged[-1].endswith("|") or len([x for x in merged[-1].split("|") if x.strip()]) < 4):
+            merged[-1] += t if merged[-1].endswith("|") or t.startswith("|") else " " + t
+        else:
+            merged.append(t)
+    items, refs = [], []
+    for ln in merged:
+        if "|" in ln:
+            parts = [p.strip() for p in ln.split("|")]
+            if not normalize_doc_code(parts[0]):
+                refs.append(parts[0])
+                continue
+            parts += [""] * (4 - len(parts))
+            items.append({"code": parts[0], "doc_number": parts[1] or "-",
+                          "subject": parts[2].rstrip(".\u2026 ") or "-",
+                          "date": parts[3], "extra_note": " / ".join(p for p in parts[4:] if p)})
+        else:
+            refs += [r for r in re.split(r"[\s,]+", ln) if r]
+    return items, refs
+
 def handle_track_backfill(text):
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     head = lines[0][len(TRACK_BACKFILL_CMD):].strip()
@@ -1181,9 +1211,8 @@ def handle_track_backfill(text):
             posted_date = d
         else:
             head_refs.append(tok)
-    pipe_items = parse_inspection_paste("\n".join(body)) if body else None
-    if body and pipe_items is None:
-        head_refs += [r for ln in body for r in re.split(r"[\s,]+", ln) if r]
+    pipe_items, extra_refs = _parse_backfill_body(body)
+    head_refs += extra_refs
     if not head_refs and not pipe_items:
         return (f'วิธีใช้:\n{TRACK_BACKFILL_CMD} AR-337 ST-802\n'
                 f'หรือ (กรณีบอทไม่มีข้อมูลเอกสาร)\n{TRACK_BACKFILL_CMD} 27/10/2026\n'
