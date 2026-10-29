@@ -679,6 +679,8 @@ def handle_text(event):
             reply(event.reply_token, set_docs_closed(text[len("เปิดเอกสาร "):], False))
         elif text in ("รอบ", "รอบแจ้ง") or text.startswith("รอบ "):
             reply(event.reply_token, handle_batch_lookup(text.split(" ", 1)[1] if " " in text else ""))
+        elif text in ("สารบัญสัปดาห์", "สารบัญ", "สารบัญสัปดาห์ก่อน", "สารบัญสัปดาห์ที่แล้ว"):
+            reply(event.reply_token, build_week_index_text(previous=text != "สารบัญสัปดาห์" and text != "สารบัญ"))
         elif text in ("คำสั่งติดตาม", "วิธีปิดเอกสาร"):
             reply(event.reply_token, FOLLOWUP_HELP_TEXT)
         elif text in ("ส่งติดตาม",):
@@ -1594,6 +1596,7 @@ FOLLOWUP_HELP_TEXT = (
     "   → นับเฉพาะทีมนั้น ทีมอื่นที่ยังไม่ตอบยังถูกแท็กต่อ\n\n"
     "③ ปิดทั้งฉบับ (ไม่ติดตามอีก ทุกทีม)\n"
     "   ปิดเอกสาร AR-338 ST-805\n\n"
+    "📚 สารบัญรอบแจ้ง: \"สารบัญสัปดาห์\" / \"สารบัญสัปดาห์ก่อน\" (ก็อปไปวางใน Note) · \"รอบ\"\n\n"
     "↩️ ยกเลิก: \"AC ยกเลิกตอบแล้ว ST-803\" · \"เปิดเอกสาร AR-338\"\n"
     "ใช้เลขที่เอกสารแทนรหัสได้ เช่น RIH-I02330 หรือ I02330 · คั่นหลายเลขด้วยเว้นวรรคหรือ ,"
 )
@@ -3190,6 +3193,169 @@ scheduler.add_job(send_overdue_digest, "cron", hour=OVERDUE_HOUR, minute=OVERDUE
 scheduler.add_job(scheduled_reply_followup, "cron", day_of_week=REMIND_DAYS_OF_WEEK,
                   hour=REMIND_HOUR, minute=REMIND_MINUTE)
 scheduler.start()
+
+# ---------- Round index: weekly Note text + /rounds web page ----------
+# 1:1 "สารบัญสัปดาห์" (or "...ก่อน") -> text to paste into a LINE group Note
+# (bots can't post Notes themselves); /rounds -> always-current web index.
+import html as _html
+
+THAI_WEEKDAYS = ["จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อา."]
+ROUNDS_PAGE_DAYS = int(os.environ.get("ROUNDS_PAGE_DAYS", "90"))
+
+def _be(d, year=True):
+    return f"{d.day:02d}/{d.month:02d}" + (f"/{(d.year + 543) % 100:02d}" if year else "")
+
+def load_batches(since_iso, until_iso=None):
+    """[{code, at(datetime), docs:[code,...]}] oldest first."""
+    conn = db()
+    try:
+        q = "SELECT batch_code, posted_at, codes FROM post_batches WHERE posted_at >= ?"
+        args = [since_iso]
+        if until_iso:
+            q += " AND posted_at < ?"
+            args.append(until_iso)
+        rows = conn.execute(q + " ORDER BY posted_at", tuple(args)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for b, at, codes in rows:
+        try:
+            when = datetime.datetime.fromisoformat(at)
+        except (ValueError, TypeError):
+            continue
+        out.append({"code": b, "at": when, "docs": [c for c in (codes or "").split(",") if c]})
+    return out
+
+def _doc_state_map(days):
+    try:
+        return {d["code"]: d for d in get_docs_status(days)}
+    except Exception:
+        app.logger.exception("doc status for round index failed")
+        return {}
+
+def rounds_page_url():
+    base = SERVICE_BASE_URL
+    if not base:
+        try:
+            base = request.host_url.rstrip("/")
+        except RuntimeError:
+            return None
+    return f"{base}/rounds" + (f"?key={REPORT_ACCESS_KEY}" if REPORT_ACCESS_KEY else "")
+
+def build_week_index_text(previous=False):
+    today = bkk_today()
+    monday = today - datetime.timedelta(days=today.weekday()) - datetime.timedelta(days=7 if previous else 0)
+    sunday = monday + datetime.timedelta(days=6)
+    tz = bkk_now().tzinfo
+    start = datetime.datetime.combine(monday, datetime.time(), tz)
+    end = start + datetime.timedelta(days=7)
+    batches = load_batches(start.isoformat(), end.isoformat())
+    last_day = sunday if any(b["at"].date() == sunday for b in batches) else monday + datetime.timedelta(days=5)
+    lines = ["📚 สารบัญแจ้งเอกสาร Request PB", f"สัปดาห์ {_be(monday, False)} – {_be(last_day)}", ""]
+    if not batches:
+        lines.append("(สัปดาห์นี้ยังไม่มีรอบแจ้งที่มีรหัส 🔖)")
+        return "\n".join(lines)
+    states = _doc_state_map(21)
+    all_codes, day = [], None
+    for b in batches:
+        d = b["at"].date()
+        if d != day:
+            if day is not None:
+                lines.append("")
+            lines.append(f"━━ {THAI_WEEKDAYS[d.weekday()]} {_be(d)} ━━")
+            day = d
+        lines.append(f"🔖 {b['code']} ({b['at'].strftime('%H:%M')}) {len(b['docs'])} ฉบับ")
+        lines.append("   " + ", ".join(b["docs"]))
+        all_codes += [c for c in b["docs"] if c not in all_codes]
+    pending = [c for c in all_codes if states.get(c, {}).get("pending")]
+    now = bkk_now()
+    lines += ["", "━━━━━━━━━━━━",
+              f"รวม {len(all_codes)} ฉบับ · ยังรอคำตอบ {len(pending)} ฉบับ "
+              f"(ณ {THAI_WEEKDAYS[now.weekday()]} {_be(now.date(), False)} {now.strftime('%H:%M')})",
+              "🔍 หาข้อความต้นฉบับ: ก็อปรหัส 🔖 ไปวางในช่องค้นหาของกลุ่ม"]
+    url = rounds_page_url()
+    if url:
+        lines.append(f"🌐 สารบัญทุกรอบ: {url}")
+    return "\n".join(lines)
+
+ROUNDS_PAGE_CSS = """
+:root{--bg:#F5F7FA;--card:#fff;--ink:#1a1a1a;--mute:#78909C;--line:#E3E7EC;--brand:#6D4C41;--blue:#1565C0;--ok:#2E7D32;--wait:#E65100}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,"Sukhumvit Set","Noto Sans Thai",sans-serif}
+header{position:sticky;top:0;background:var(--card);border-bottom:1px solid var(--line);padding:14px 16px;z-index:2}
+h1{font-size:17px;margin:0 0 8px}input{width:100%;font-size:16px;padding:10px 12px;border:1px solid var(--line);border-radius:10px}
+.sum{font-size:12px;color:var(--mute);margin-top:6px}main{padding:8px 16px 40px;max-width:760px;margin:0 auto}
+h2{font-size:13px;color:var(--mute);margin:20px 0 6px;letter-spacing:.3px}h3{font-size:13px;margin:12px 0 4px;color:#455A64}
+.round{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:8px 0}
+.rh{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.rc{font-weight:700;color:var(--brand)}
+.rt{font-size:12px;color:var(--mute)}.doc{border-top:1px dashed var(--line);padding:7px 0 2px;font-size:13px}
+.doc:first-of-type{border-top:0}.dc{font-weight:700;color:var(--blue)}.dn{color:var(--mute);font-size:12px}
+.st{font-size:12px;margin-top:2px}.ok{color:var(--ok)}.wait{color:var(--wait)}.closed{color:var(--mute)}
+.empty{color:var(--mute);text-align:center;padding:30px}.hide{display:none}
+"""
+
+@app.route("/rounds", methods=["GET"])
+def rounds_page():
+    if REPORT_ACCESS_KEY and request.args.get("key", "") != REPORT_ACCESS_KEY:
+        abort(403)
+    esc = _html.escape
+    since = (bkk_now() - datetime.timedelta(days=ROUNDS_PAGE_DAYS)).isoformat()
+    batches = load_batches(since)
+    states = _doc_state_map(ROUNDS_PAGE_DAYS)
+    conn = db()
+    try:
+        info = {c: (n, sj) for c, n, sj in conn.execute(
+            "SELECT code, doc_number, subject FROM inspection_docs WHERE posted_at >= ?", (since,)).fetchall()}
+    finally:
+        conn.close()
+    body, week, day, total_docs = [], None, None, 0
+    for b in reversed(batches):  # newest first
+        d = b["at"].date()
+        monday = d - datetime.timedelta(days=d.weekday())
+        if monday != week:
+            body.append(f"<h2>สัปดาห์ {_be(monday, False)} – {_be(monday + datetime.timedelta(days=5))}</h2>")
+            week, day = monday, None
+        if d != day:
+            body.append(f"<h3>{THAI_WEEKDAYS[d.weekday()]} {_be(d)}</h3>")
+            day = d
+        docs_html, search = [], [b["code"]]
+        for c in b["docs"]:
+            total_docs += 1
+            num, subj = info.get(c, ("", ""))
+            st = states.get(c)
+            if not st:
+                status = ""
+            elif st["closed"]:
+                status = '<div class="st closed">🔒 ปิดแล้ว</div>'
+            elif st["status"]:
+                status = '<div class="st">' + " &nbsp; ".join(
+                    f'<span class="{"ok" if x["done"] else "wait"}">{"✅" if x["done"] else "⏳"} {esc(x["label"])}</span>'
+                    for x in st["status"]) + "</div>"
+            else:
+                status = f'<div class="st {"wait" if st["pending"] else "ok"}">{"⏳ รอคำตอบ" if st["pending"] else "✅ ตอบแล้ว"}</div>'
+            search += [c, num or "", subj or ""]
+            docs_html.append(f'<div class="doc"><span class="dc">{esc(c)}</span> '
+                             f'<span class="dn">{esc(num or "")}</span><div>{esc(subj or "-")}</div>{status}</div>')
+        body.append(f'<div class="round" data-s="{esc(" ".join(search).lower())}">'
+                    f'<div class="rh"><span class="rc">🔖 {esc(b["code"])}</span>'
+                    f'<span class="rt">{b["at"].strftime("%H:%M")} น. · {len(b["docs"])} ฉบับ</span></div>'
+                    + "".join(docs_html) + "</div>")
+    if not body:
+        body.append('<div class="empty">ยังไม่มีรอบแจ้งที่มีรหัส 🔖</div>')
+    page = f"""<!doctype html><html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>สารบัญรอบแจ้ง PB</title>
+<style>{ROUNDS_PAGE_CSS}</style></head><body>
+<header><h1>📚 สารบัญรอบแจ้งเอกสาร Request PB</h1>
+<input id="q" type="search" placeholder="ค้นหา: รหัสรอบ, ST-814, RIH-I02376, คำในหัวเรื่อง" autocomplete="off">
+<div class="sum" id="sum">{len(batches)} รอบ · {total_docs} ฉบับ · ย้อนหลัง {ROUNDS_PAGE_DAYS} วัน · ข้อมูล ณ {bkk_now().strftime('%d/%m %H:%M')} น.</div></header>
+<main>{''.join(body)}<div class="empty hide" id="none">ไม่พบรายการที่ค้นหา</div></main>
+<script>
+const q=document.getElementById('q'),rs=[...document.querySelectorAll('.round')],none=document.getElementById('none');
+function f(){{const v=q.value.trim().toLowerCase();let n=0;rs.forEach(r=>{{const m=!v||r.dataset.s.includes(v);r.classList.toggle('hide',!m);if(m)n++}});
+document.querySelectorAll('h2,h3').forEach(h=>{{let e=h.nextElementSibling,any=false;while(e&&e.tagName!=='H2'&&!(h.tagName==='H3'&&e.tagName==='H3')){{if(e.classList.contains('round')&&!e.classList.contains('hide'))any=true;e=e.nextElementSibling}}h.classList.toggle('hide',!any)}});
+none.classList.toggle('hide',n>0||!rs.length)}}
+q.addEventListener('input',f);const p=new URLSearchParams(location.search).get('q');if(p){{q.value=p;f()}}
+</script></body></html>"""
+    return Response(page, mimetype="text/html")
 
 @app.route("/", methods=["GET"])
 def health():
