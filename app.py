@@ -893,6 +893,15 @@ def role_header(line):
         return None
     return ROLE_HEADERS.get(words[0])
 
+SITEAROUND_ROLE_RE = re.compile(r"^(?:RIH|AIH)-([IR])", re.IGNORECASE)
+
+def role_from_sitearound_code(doc_number):
+    """Site Around code decides the role when the paste doesn't say:
+    RIH-R... / AIH-R... = Assignee (area handover), anything else (RIH-I...) =
+    Inspector. An explicit "A|"/"I|" field or header line always wins."""
+    m = SITEAROUND_ROLE_RE.match((doc_number or "").strip())
+    return ROLE_ASSIGNEE if m and m.group(1).upper() == "R" else ROLE_INSPECTOR
+
 def parse_inspection_paste(text):
     """Parses pasted lines of 4+ pipe-separated fields per document:
     code|doc_number|subject|date[|extra date/notes...], e.g.:
@@ -913,7 +922,7 @@ def parse_inspection_paste(text):
     if not lines or not any("|" in ln for ln in lines):
         return None
     items = []
-    current_role = ROLE_INSPECTOR
+    current_role = None  # set by a header line; None = decide per line
     for ln in lines:
         if "|" not in ln and role_header(ln):
             current_role = role_header(ln)
@@ -928,6 +937,7 @@ def parse_inspection_paste(text):
         if len(parts) < 4:
             return None
         code, doc_number, subject, date_str = parts[0], parts[1], parts[2], parts[3]
+        role = role or role_from_sitearound_code(doc_number)
         extra_note = " / ".join(p for p in parts[4:] if p)
         if not code or not doc_number or not subject or not date_str:
             return None
