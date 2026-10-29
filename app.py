@@ -1723,10 +1723,11 @@ def build_system_summary_texts(arg=""):
             texts = []
             for ids, uid, text in replies_by_code.get(d["code"], []):
                 if uid in markers or (ids & members):
-                    t = " ".join((text or "").split())
+                    t = " ".join((text or "").split()).replace("(ตอบส่วนตัวกับแอดมิน)", "(ส่วนตัว)")
                     if t and t not in texts:
                         texts.append(t)
             row = {"code": d["code"], "posted": thai_short_date(d["posted_at"]),
+                   "pday": (d["posted_at"] or "")[:10],
                    "key": _doc_number_sort_key(d["code"], doc_numbers.get(d["code"])),
                    "subject": d["subject"] or "-", "texts": texts}
             if done:
@@ -1736,32 +1737,40 @@ def build_system_summary_texts(arg=""):
                 answered.append(row)
             else:
                 waiting.append(row)
-        answered.sort(key=lambda r: r["key"])
-        waiting.sort(key=lambda r: r["key"])
+        # grouped under a "📅 date" header per day the bot posted, oldest day
+        # first; inside a day, by document number (smallest first)
+        answered.sort(key=lambda r: ((r["pday"] or ""), r["key"]))
+        waiting.sort(key=lambda r: ((r["pday"] or ""), r["key"]))
+
+        def grouped(rows, value):
+            out, last = [], None
+            for r in rows:
+                if r["posted"] != last:
+                    if last is not None:
+                        out.append("")
+                    out.append(f"📅 {r['posted']}")
+                    last = r["posted"]
+                out.append(f"{r['code']} │ {value(r)}")
+            return out
         label = system + (" (A+B)" if len(sys_teams) > 1 else "")
         total = len(answered) + len(waiting)
         lines = [f"📋 สรุปคำตอบระบบ {label}",
                  f"🔎 ข้อมูล ณ {thai_short_date(now, with_time=True)}",
-                 f"📅 เอกสารที่บอทแจ้งใน {days} วันล่าสุด · {total} ฉบับ",
+                 f"🗂 เอกสารที่บอทแจ้งใน {days} วันล่าสุด · {total} ฉบับ",
                  "━━━━━━━━━━━━━━━",
                  "",
                  f"✅ {system} ตอบแล้ว ({len(answered)} ฉบับ)",
                  ""]
         if not answered:
             lines.append("   — ยังไม่มี —")
-        for r in answered:
-            ans = " / ".join(r["texts"]) or "ตอบแล้ว"
-            lines.append(f"{r['posted']} │ {r['code']} │ {ans}")
+        lines += grouped(answered, lambda r: " / ".join(r["texts"]) or "ตอบแล้ว")
         lines += ["", "━━━━━━━━━━━━━━━", "",
                   f"⏳ {system} ยังไม่ได้ตอบ ({len(waiting)} ฉบับ)", ""]
         if not waiting:
             lines.append("   — ตอบครบทุกฉบับแล้ว 🎉 —")
-        for r in waiting:
-            subj = r["subject"]
-            if len(subj) > SYSTEM_SUMMARY_SUBJECT_MAX:
-                subj = subj[:SYSTEM_SUMMARY_SUBJECT_MAX].rstrip() + "…"
-            lines.append(f"{r['posted']} │ {r['code']} │ {subj}")
-        lines += ["", "(วันที่หน้ารายการ = วันที่บอทแจ้งเอกสารในไลน์ · เรียงตามเลขที่เอกสาร)"]
+        lines += grouped(waiting, lambda r: r["subject"] if len(r["subject"]) <= SYSTEM_SUMMARY_SUBJECT_MAX
+                         else r["subject"][:SYSTEM_SUMMARY_SUBJECT_MAX].rstrip() + "…")
+        lines += ["", "(📅 = วันที่บอทแจ้งเอกสารในไลน์ · ในแต่ละวันเรียงตามเลขที่เอกสาร)"]
         text = "\n".join(lines)
         if len(text) > 4900:
             text = text[:4880] + "\n…(ยาวเกิน แสดงไม่ครบ)"
