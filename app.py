@@ -264,6 +264,10 @@ def init_db_schema():
             client.execute("ALTER TABLE inspection_docs ADD COLUMN batch_code TEXT")
         except Exception:
             pass
+        try:  # added later: who created the doc in Site Around (PB / STI)
+            client.execute("ALTER TABLE inspection_docs ADD COLUMN source TEXT")
+        except Exception:
+            pass
     finally:
         client.close()
 
@@ -811,6 +815,17 @@ def handle_text(event):
     conn.close()
 
 # ---------- Inspection document list (paste from Claude in Chrome) ----------
+SOURCE_TAGS = ("PB", "STI")
+
+def split_source_tag(parts):
+    """A trailing field that is exactly a creator tag (PB / STI, any case)
+    marks who created the document in Site Around. Only checked when the line
+    already has 5+ fields, so a 4-field line is never misread. Returns
+    (source, remaining_parts); source is "" when there is no tag."""
+    if len(parts) >= 5 and parts[-1].strip().upper() in SOURCE_TAGS:
+        return parts[-1].strip().upper(), parts[:-1]
+    return "", parts
+
 def parse_inspection_paste(text):
     """Parses pasted lines of 4+ pipe-separated fields per document:
     code|doc_number|subject|date[|extra date/notes...], e.g.:
@@ -819,8 +834,9 @@ def parse_inspection_paste(text):
     separate extra_note field (joined with " / ") instead of rejecting the
     whole paste - Claude in Chrome sometimes adds a genuinely useful extra
     date (e.g. a concrete-pour date) past the confirmed 4-field template.
-    Returns a list of {"code", "doc_number", "subject", "date", "extra_note"}
-    dicts (extra_note is "" when the line had no 5th+ field).
+    Returns a list of {"code", "doc_number", "subject", "date", "extra_note",
+    "source"} dicts (extra_note is "" when the line had no 5th+ field; source
+    is "PB"/"STI" when the line ends with that tag as its own field, else "").
     Returns None when NO line contains "|" at all, so a plain command like
     "สรุป" or "ยกเลิก" still falls through to the other 1:1 commands
     untouched. If a line DOES contain "|" but is missing a required field,
@@ -834,13 +850,16 @@ def parse_inspection_paste(text):
         parts = [p.strip() for p in ln.split("|")]
         if len(parts) < 4:
             return None
+        source, parts = split_source_tag(parts)
+        if len(parts) < 4:
+            return None
         code, doc_number, subject, date_str = parts[0], parts[1], parts[2], parts[3]
         extra_note = " / ".join(p for p in parts[4:] if p)
         if not code or not doc_number or not subject or not date_str:
             return None
         items.append({
             "code": code, "doc_number": doc_number, "subject": subject,
-            "date": date_str, "extra_note": extra_note,
+            "date": date_str, "extra_note": extra_note, "source": source,
         })
     return items
 
@@ -972,6 +991,8 @@ def build_inspection_carousel_flex(items):
     for it in shown:
         body = []
         body.append(doc_number_badge(it["code"]))
+        if it.get("source"):
+            body.append(field("🏢", "ผู้สร้างเอกสาร", it["source"], INSPECTION_VALUE_COLOR, bold=True))
         body.append(field("🔖", "Code", it["doc_number"], INSPECTION_VALUE_COLOR))
         body.append(field("📝", "เรื่อง", it["subject"], INSPECTION_VALUE_COLOR))
         body.append(field("📅", "วันที่ส่งเอกสารเข้าระบบ", it["date"], INSPECTION_VALUE_COLOR))
@@ -1129,13 +1150,13 @@ def save_inspection_docs(items, group_id, batch_code=None):
         for it in items:
             code = normalize_doc_code(it["code"]) or it["code"].strip().upper()
             rows.append((code, it["doc_number"], it["subject"], it["date"],
-                         it.get("extra_note", ""), group_id, now_iso, batch_code))
+                         it.get("extra_note", ""), group_id, now_iso, batch_code, it.get("source", "")))
         conn.executemany(
-            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, batch_code) "
-            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
+            "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, batch_code, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET "
             "doc_number = excluded.doc_number, subject = excluded.subject, date = excluded.date, "
             "extra_note = excluded.extra_note, group_id = excluded.group_id, posted_at = excluded.posted_at, "
-            "batch_code = excluded.batch_code",
+            "batch_code = excluded.batch_code, source = excluded.source",
             rows,
         )
         if batch_code:
@@ -1186,13 +1207,15 @@ def _parse_backfill_body(body):
     for ln in merged:
         if "|" in ln:
             parts = [p.strip() for p in ln.split("|")]
+            source, parts = split_source_tag(parts)
             if not normalize_doc_code(parts[0]):
                 refs.append(parts[0])
                 continue
             parts += [""] * (4 - len(parts))
             items.append({"code": parts[0], "doc_number": parts[1] or "-",
                           "subject": parts[2].rstrip(".\u2026 ") or "-",
-                          "date": parts[3], "extra_note": " / ".join(p for p in parts[4:] if p)})
+                          "date": parts[3], "extra_note": " / ".join(p for p in parts[4:] if p),
+                          "source": source})
         else:
             refs += [r for r in re.split(r"[\s,]+", ln) if r]
     return items, refs
@@ -1234,10 +1257,10 @@ def handle_track_backfill(text):
                 (reopened if row[0] else kept).append(code)
             else:
                 conn.execute(
-                    "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO inspection_docs (code, doc_number, subject, date, extra_note, group_id, posted_at, source) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
                     (code, it["doc_number"], it["subject"], it["date"], it.get("extra_note", ""),
-                     group_id, posted_iso))
+                     group_id, posted_iso, it.get("source", "")))
                 added.append(code)
         for ref in head_refs:
             code = normalize_doc_code(ref)
