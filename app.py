@@ -540,7 +540,7 @@ INSPECTION_FILES_URL = os.environ.get(
 )
 
 def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_text, lead_contents, mention_text="โปรดตรวจสอบและตอบกลับแอดมิน ส่วนรายการไฟล์เอกสารอยู่ในลิ้งด้านล่างค่ะ",
-                              batch_code=None, doc_codes=None, mention_user_id=None):
+                              batch_code=None, doc_codes=None, mention_user_id=None, include_files_link=True):
     """Pushes a lead announcement Flex (so part of its text can be colored),
     then the documents Flex, then an '@All'-mention text message, to the
     given group. mention_user_id tags just that one person instead (e.g. the
@@ -559,7 +559,7 @@ def push_mention_all_to_group(group_id, flex_alt_text, flex_contents, lead_alt_t
             "text": (f"🔖 {batch_code} · {', '.join(doc_codes or [])}\n" if batch_code else "")
                     + f"{{user1}} {mention_text}"
                     + (f"\n{INSPECTION_FILES_URL}"
-                       if INSPECTION_FILES_URL else ""),
+                       if INSPECTION_FILES_URL and include_files_link else ""),
             "substitution": {"user1": {"type": "mention", "mentionee": (
                 {"type": "user", "userId": mention_user_id} if mention_user_id else {"type": "all"})}},
         },
@@ -1258,6 +1258,7 @@ def post_role_list(target, role, items):
         else:
             kwargs = {"mention_text": ASSIGNEE_MENTION_TEXT}
             note = ' ⚠️ ยังไม่ได้ตั้ง CO เลยแท็ก @All แทน (ตั้งในกลุ่ม: "ตั้งผู้รับผิดชอบ CO @ชื่อ")'
+        kwargs["include_files_link"] = False  # CO works in Site Around itself - no files link
     label = "รับมอบพื้นที่ (Assignee)" if role == ROLE_ASSIGNEE else "Request (Inspector)"
     try:
         push_mention_all_to_group(target, alt_text, contents, lead_alt_text, lead_contents,
