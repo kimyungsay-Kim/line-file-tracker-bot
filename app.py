@@ -457,13 +457,28 @@ def push_to(user_id, text):
 def push_to_owner(text):
     push_to(OWNER_USER_ID, text)
 
+def _flex_messages(alt_text, contents_dict):
+    """contents_dict may be one bubble/carousel or a list of bubbles (one message each)."""
+    items = contents_dict if isinstance(contents_dict, list) else [contents_dict]
+    return [FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(c)) for c in items[:5]]
+
 def reply_flex(reply_token, alt_text, contents_dict):
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
-        api.reply_message(ReplyMessageRequest(
-            reply_token=reply_token,
-            messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict))]
-        ))
+        try:
+            api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=_flex_messages(alt_text, contents_dict)
+            ))
+        except Exception as e:
+            # never leave the user with silence: a rejected reply does not
+            # consume the reply token, so fall back to a plain-text notice
+            app.logger.exception("reply_flex failed")
+            detail = getattr(e, "body", "") or str(e)
+            api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=f"⚠️ {alt_text}\nส่งการ์ดสรุปไม่สำเร็จ: {str(detail)[:300]}")]
+            ))
 
 def push_flex_to(user_id, alt_text, contents_dict):
     if not user_id:
@@ -472,7 +487,7 @@ def push_flex_to(user_id, alt_text, contents_dict):
         api = MessagingApi(api_client)
         api.push_message(PushMessageRequest(
             to=user_id,
-            messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents_dict))]
+            messages=_flex_messages(alt_text, contents_dict)
         ))
 
 def push_flex_to_owner(alt_text, contents_dict):
@@ -3152,17 +3167,53 @@ def build_summary_flex(date=None, user_id=None):
     else:
         body.append(txt(CLOSE_HELP_TEXT, size="xs", color="#888888", margin="md"))
 
-    contents = {
-        "type": "bubble",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "xs",
-            "contents": body
-        }
-    }
     alt_text = f"สรุปรายการที่แท็คคุณ วันที่ {date_str} ({item_count} รายการ)"
-    return (alt_text, contents)
+    # LINE rejects any bubble whose JSON is over 30 KB. Pending items carry
+    # over day to day, so one bubble eventually overflowed and the reply/push
+    # failed silently (400 "Too large flex message"). Split into several
+    # bubbles, each sent as its own message (a reply/push holds up to 5).
+    return (alt_text, split_body_into_bubbles(body, header_blocks=3))
+
+SUMMARY_BUBBLE_MAX_BYTES = 27000   # LINE cap is 30 KB per bubble; keep headroom
+SUMMARY_MAX_BUBBLES = 5            # max messages in one reply/push request
+
+def _bubble_from(blocks):
+    return {"type": "bubble",
+            "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": blocks}}
+
+def _json_size(obj):
+    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+def split_body_into_bubbles(body, header_blocks=0, max_bubbles=SUMMARY_MAX_BUBBLES):
+    """Pack body components into as few bubbles as fit under LINE's size cap.
+    Continuation bubbles start with a small "(ต่อ k/N)" line. Returns a list."""
+    head, rest = body[:header_blocks], body[header_blocks:]
+    chunks, current = [], list(head)
+    for block in rest:
+        if len(current) > (header_blocks if not chunks else 1) and \
+                _json_size(_bubble_from(current + [block])) > SUMMARY_BUBBLE_MAX_BYTES:
+            chunks.append(current)
+            current = [None]  # placeholder for the continuation label
+        current.append(block)
+    chunks.append(current)
+
+    total = len(chunks)
+    dropped = 0
+    if total > max_bubbles:
+        dropped = total - max_bubbles
+        app.logger.warning("summary needs %d bubbles, sending %d", total, max_bubbles)
+        chunks = chunks[:max_bubbles]
+    shown = len(chunks)
+    bubbles = []
+    for i, blocks in enumerate(chunks, start=1):
+        if blocks and blocks[0] is None:
+            blocks[0] = flex_txt(f"📋 สรุป (ต่อ {i}/{shown})", size="xs", color="#888888")
+        if dropped and i == shown:
+            blocks.append(flex_txt(f"… ยังมีรายการอีกประมาณ {dropped} หน้าที่ส่งไม่ได้ (เกินขีดจำกัด LINE) "
+                                   "ปิดสถานะรายการที่โหลดแล้วเพื่อให้สรุปสั้นลง",
+                                   size="xs", color="#C62828", margin="md", wrap=True))
+        bubbles.append(_bubble_from(blocks))
+    return bubbles
 
 def _normalize_name_for_match(name):
     # strip whitespace and any surrounding bracket/quote characters people
