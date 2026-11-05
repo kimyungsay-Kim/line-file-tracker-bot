@@ -29,7 +29,7 @@ services:
       - key: REMIND_MINUTE
         value: "0"
       - key: REMIND_DAYS_OF_WEEK
-        value: mon-sat
+        value: tue,sat
       - key: TAG_LOOKBACK_MINUTES
         value: "30"
       - key: TURSO_DATABASE_URL
