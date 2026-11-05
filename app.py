@@ -611,6 +611,30 @@ def handle_file(event):
     conn.commit()
     conn.close()
 
+# --- 1:1 tag summary per group: "สรุป PM" / "สรุป BIM" / "สรุป REQ" ---
+TAG_SUMMARY_PREFIXES = ("สรุปแท็ก", "สรุป", "แท็ก", "แท็ค")
+TAG_SUMMARY_HELP_TEXT = (
+    "📋 คำสั่งสรุปแท็กงาน (พิมพ์ในแชท 1:1 กับบอท)\n"
+    "• สรุป — ทุกกลุ่ม\n"
+    "• สรุป PM — กลุ่ม Project Management Team\n"
+    "• สรุป BIM — กลุ่ม BIM & Shop Dwg.\n"
+    "• สรุป REQ — กลุ่ม Req't Document\n"
+    "(ใช้ \"แท็ก PM\" หรือ \"สรุปแท็ก PM\" แทนได้)\n\n"
+    "ปิดรายการ: \"✅ PM\" ปิดทั้งกลุ่ม, \"✅ PM <ชื่อคน>\" ปิดเฉพาะคน\n"
+    "📅 ติดตามเอกสารอัตโนมัติ 09:00 น. เฉพาะวันอังคาร/เสาร์ (งดวันหยุดนักขัตฤกษ์)\n"
+    "ดู/แก้วันหยุด: \"วันหยุด\", \"เพิ่มวันหยุด 25/11/2569\", \"ลบวันหยุด 25/11/2569\""
+)
+
+def parse_tag_summary_cmd(text):
+    """'สรุป PM' / 'สรุปPM' / 'แท็ก bim' / 'สรุปแท็ก REQ' -> 'PM'/'BIM'/'REQ', else None."""
+    t = text.strip()
+    for prefix in TAG_SUMMARY_PREFIXES:
+        if t.startswith(prefix):
+            code = t[len(prefix):].strip().upper()
+            if code in GROUP_ALIASES:
+                return code
+    return None
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
     source = event.source
@@ -657,7 +681,24 @@ def handle_text(event):
             reply(event.reply_token, manual_answer)
             return
 
-        if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์"):
+        holiday_reply = handle_holiday_command(text)
+        if holiday_reply is not None:
+            reply(event.reply_token, holiday_reply)
+            return
+
+        tag_code = parse_tag_summary_cmd(text)
+        if tag_code:
+            alt_text, contents = build_summary_flex(group_code=tag_code)
+            if contents is None:
+                reply(event.reply_token, alt_text)
+            else:
+                reply_flex(event.reply_token, alt_text, contents)
+            return
+        if text in ("คำสั่งแท็ก", "คำสั่งสรุป"):
+            reply(event.reply_token, TAG_SUMMARY_HELP_TEXT)
+            return
+
+        if text in ("สรุป", "สรุปไฟล์", "summary", "เช็คไฟล์", "สรุปแท็ก", "แท็ก"):
             # shared summary: everyone tracked sees the same tagged events,
             # regardless of who specifically got tagged
             alt_text, contents = build_summary_flex()
@@ -689,7 +730,7 @@ def handle_text(event):
             else:
                 reply_flex_and_text(event.reply_token, alt_text, contents,
                                     f'{who}\n\nตัวอย่างข้อความติดตามที่จะส่งเข้ากลุ่มอัตโนมัติ {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น. '
-                                    f'({REMIND_DAYS_OF_WEEK}) — ส่งตอนนี้: พิมพ์ "ติดตาม" ในกลุ่ม (ฟรี) หรือ "ส่งติดตาม" ที่นี่ (ใช้โควตา Push) ครับ' + '\nบันทึกว่าตอบแล้ว/ปิดบางรายการ: พิมพ์ "คำสั่งติดตาม"')
+                                    f'({REMIND_DAYS_TH}, งดวันหยุดนักขัตฤกษ์) — ส่งตอนนี้: พิมพ์ "ติดตาม" ในกลุ่ม (ฟรี) หรือ "ส่งติดตาม" ที่นี่ (ใช้โควตา Push) ครับ' + '\nบันทึกว่าตอบแล้ว/ปิดบางรายการ: พิมพ์ "คำสั่งติดตาม"')
         elif text in ("บัดดี้", "ผู้รับผิดชอบ"):
             reply(event.reply_token, build_buddy_list_text())
         elif text.startswith("ลบบัดดี้ "):
@@ -2468,12 +2509,115 @@ def handle_manual_answer(user_id, text):
 #   1:1 "ส่งติดตาม"  -> post it to the group(s) right now
 REMIND_HOUR = int(os.environ.get("REMIND_HOUR", "9"))
 REMIND_MINUTE = int(os.environ.get("REMIND_MINUTE", "0"))
-REMIND_DAYS_OF_WEEK = os.environ.get("REMIND_DAYS_OF_WEEK", "mon-sat")  # APScheduler day_of_week syntax
+REMIND_DAYS_OF_WEEK = os.environ.get("REMIND_DAYS_OF_WEEK", "tue,sat")  # APScheduler day_of_week syntax
+_DOW_TH = {"mon": "จันทร์", "tue": "อังคาร", "wed": "พุธ", "thu": "พฤหัสฯ", "fri": "ศุกร์", "sat": "เสาร์", "sun": "อาทิตย์"}
+REMIND_DAYS_TH = "/".join(_DOW_TH.get(x.strip().lower(), x.strip()) for x in REMIND_DAYS_OF_WEEK.split(","))
 REMIND_WINDOW_DAYS = int(os.environ.get("REMIND_WINDOW_DAYS", str(REPLIES_OVERVIEW_DAYS)))
 REMIND_LATE_DAYS = int(os.environ.get("REMIND_LATE_DAYS", "3"))   # waited this long or more -> red
 REMIND_MAX_DOCS = 25
 REMIND_HEADER_COLOR = "#E65100"
 REMIND_WAIT_COLOR = "#EF6C00"
+
+# --- Thai public holidays: the scheduled follow-up is skipped on these days ---
+# Built-in list (government holidays incl. substitution days). Cabinet often
+# adds special days later, so the owner can add/remove days in 1:1 chat:
+#   "วันหยุด"                    -> list upcoming holidays
+#   "เพิ่มวันหยุด 25/11/2569"     -> add (Thai B.E. or A.D. year, or 2026-11-25)
+#   "ลบวันหยุด 25/11/2569"       -> remove (also works on a built-in day)
+# Extra days can also come from the HOLIDAYS env var: "2026-11-25,2027-05-07".
+BUILTIN_HOLIDAYS = {
+    # 2569 / 2026
+    "2026-12-05": "วันพ่อแห่งชาติ", "2026-12-07": "ชดเชยวันพ่อแห่งชาติ",
+    "2026-12-10": "วันรัฐธรรมนูญ", "2026-12-31": "วันสิ้นปี",
+    # 2570 / 2027
+    "2027-01-01": "วันขึ้นปีใหม่", "2027-02-21": "วันมาฆบูชา", "2027-02-22": "ชดเชยวันมาฆบูชา",
+    "2027-04-06": "วันจักรี", "2027-04-13": "วันสงกรานต์", "2027-04-14": "วันสงกรานต์",
+    "2027-04-15": "วันสงกรานต์", "2027-05-01": "วันแรงงาน", "2027-05-03": "ชดเชยวันแรงงาน",
+    "2027-05-04": "วันฉัตรมงคล", "2027-05-20": "วันวิสาขบูชา",
+    "2027-06-03": "วันเฉลิมฯ พระราชินี", "2027-07-18": "วันอาสาฬหบูชา",
+    "2027-07-19": "วันเข้าพรรษา", "2027-07-20": "ชดเชยวันอาสาฬหบูชา",
+    "2027-07-28": "วันเฉลิมฯ ร.10", "2027-08-12": "วันแม่แห่งชาติ",
+    "2027-10-13": "วันนวมินทรมหาราช", "2027-10-23": "วันปิยมหาราช",
+    "2027-10-25": "ชดเชยวันปิยมหาราช", "2027-12-05": "วันพ่อแห่งชาติ",
+    "2027-12-06": "ชดเชยวันพ่อแห่งชาติ", "2027-12-10": "วันรัฐธรรมนูญ", "2027-12-31": "วันสิ้นปี",
+}
+THAI_MONTH_ABBR = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+
+def _parse_holiday_date(text):
+    """'25/11/2569', '25/11/69', '25/11/2026', '2026-11-25' -> date, else None."""
+    text = (text or "").strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", text):
+            y, m, d = (int(x) for x in text.split("-"))
+        else:
+            mt = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})", text)
+            if not mt:
+                return None
+            d, m, y = (int(x) for x in mt.groups())
+            if y < 100:
+                y += 2500
+            if y > 2400:
+                y -= 543
+        return datetime.date(y, m, d)
+    except ValueError:
+        return None
+
+def _setting_dates(key):
+    return {x for x in get_setting(key, "").split(",") if x}
+
+def holiday_map():
+    """{iso_date: name} after applying owner additions/removals and HOLIDAYS env."""
+    out = dict(BUILTIN_HOLIDAYS)
+    for x in os.environ.get("HOLIDAYS", "").split(","):
+        dt = _parse_holiday_date(x)
+        if dt:
+            out.setdefault(dt.isoformat(), "วันหยุด (ตั้งค่า)")
+    for iso in _setting_dates("holidays_added"):
+        out.setdefault(iso, "วันหยุดเพิ่มเติม")
+    for iso in _setting_dates("holidays_removed"):
+        out.pop(iso, None)
+    return out
+
+def is_holiday(date=None):
+    return (date or bkk_today()).isoformat() in holiday_map()
+
+def _thai_date(dt):
+    return f"{dt.day} {THAI_MONTH_ABBR[dt.month - 1]} {dt.year + 543}"
+
+def handle_holiday_command(text):
+    """Returns a reply for วันหยุด / เพิ่มวันหยุด / ลบวันหยุด, or None if not one."""
+    if text in ("วันหยุด", "วันหยุดนักขัตฤกษ์"):
+        today = bkk_today()
+        upcoming = sorted((k, v) for k, v in holiday_map().items() if k >= today.isoformat())[:15]
+        if not upcoming:
+            return 'ยังไม่มีวันหยุดข้างหน้าในระบบครับ เพิ่มได้ด้วย "เพิ่มวันหยุด 25/11/2569"'
+        days = ["จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อา."]
+        lines = ["📅 วันหยุดข้างหน้า (ไม่ส่งติดตามเอกสาร):"]
+        for iso, name in upcoming:
+            dt = datetime.date.fromisoformat(iso)
+            mark = " ⛔ งดติดตาม" if dt.strftime("%a").lower()[:3] in REMIND_DAYS_OF_WEEK.lower() else ""
+            lines.append(f"• {days[dt.weekday()]} {_thai_date(dt)} {name}{mark}")
+        lines.append('\nเพิ่ม: "เพิ่มวันหยุด 25/11/2569" · ลบ: "ลบวันหยุด 25/11/2569"')
+        return "\n".join(lines)
+    for cmd, adding in (("เพิ่มวันหยุด", True), ("ลบวันหยุด", False)):
+        if text.startswith(cmd):
+            arg = text[len(cmd):].strip()
+            dts = [_parse_holiday_date(a) for a in re.split(r"[\s,]+", arg) if a]
+            if not dts or None in dts:
+                return f'รูปแบบวันที่ไม่ถูกต้องครับ เช่น "{cmd} 25/11/2569" (ใส่หลายวันคั่นด้วยช่องว่างได้)'
+            added, removed = _setting_dates("holidays_added"), _setting_dates("holidays_removed")
+            for dt in dts:
+                iso = dt.isoformat()
+                if adding:
+                    added.add(iso); removed.discard(iso)
+                else:
+                    added.discard(iso); removed.add(iso)
+            set_setting("holidays_added", ",".join(sorted(added)))
+            set_setting("holidays_removed", ",".join(sorted(removed)))
+            names = ", ".join(_thai_date(d) for d in dts)
+            return (f"เพิ่มวันหยุด {names} แล้วครับ — วันนั้นจะไม่ส่งติดตามเอกสาร" if adding
+                    else f"ลบวันหยุด {names} แล้วครับ — ถ้าตรงวันอังคาร/เสาร์จะส่งติดตามตามปกติ")
+    return None
 
 def get_unanswered_docs_by_group():
     """{group_id: [doc dict, ...]} for docs still waiting, oldest first."""
@@ -2680,6 +2824,10 @@ def send_reply_followup(force=False):
     return "\n".join(lines)
 
 def scheduled_reply_followup():
+    if is_holiday():
+        app.logger.warning("follow-up skipped: %s is a public holiday (%s)",
+                           bkk_today().isoformat(), holiday_map().get(bkk_today().isoformat()))
+        return
     try:
         result = send_reply_followup()
         if "⚠️" in result or "ไม่สำเร็จ" in result:
@@ -3067,7 +3215,7 @@ def message_text_component(prefix, text_content, mention_spans_json, suffix="", 
     d.update(kwargs)
     return d
 
-def build_summary_flex(date=None, user_id=None):
+def build_summary_flex(date=None, user_id=None, group_code=None):
     """Returns (alt_text, flex_contents_dict). flex_contents_dict is None when
     there's nothing to show, in which case alt_text is the plain message to send instead.
     When user_id is given, only shows events where THAT specific person was tagged
@@ -3100,6 +3248,11 @@ def build_summary_flex(date=None, user_id=None):
                 return True
         rows = [r for r in rows if includes_user(r[9])]
 
+    if group_code:
+        rows = [r for r in rows if group_short_code(r[0]) == group_code]
+        if not rows:
+            return (f"กลุ่ม {group_code} ไม่มีรายการแท็กงานค้างครับ 🎉 (วันที่ {date_str})", None)
+
     if not rows:
         return (f"วันที่ {date_str} ยังไม่มีข้อความที่มีคนแท็คคุณครับ", None)
 
@@ -3111,7 +3264,8 @@ def build_summary_flex(date=None, user_id=None):
 
     txt = flex_txt
 
-    body = [txt(f"📋 สรุปรายการที่แท็คคุณ", weight="bold", size="lg", color="#111111")]
+    title = f"📋 สรุปแท็กงาน · {group_code}" if group_code else "📋 สรุปรายการที่แท็คคุณ"
+    body = [txt(title, weight="bold", size="lg", color="#111111")]
     body.append(txt(date_str, size="sm", color="#888888", margin="xs"))
     body.append({"type": "separator", "margin": "md"})
 
@@ -3167,7 +3321,8 @@ def build_summary_flex(date=None, user_id=None):
     else:
         body.append(txt(CLOSE_HELP_TEXT, size="xs", color="#888888", margin="md"))
 
-    alt_text = f"สรุปรายการที่แท็คคุณ วันที่ {date_str} ({item_count} รายการ)"
+    alt_text = (f"สรุปแท็กงาน {group_code} วันที่ {date_str} ({item_count} รายการ)" if group_code
+                else f"สรุปรายการที่แท็คคุณ วันที่ {date_str} ({item_count} รายการ)")
     # LINE rejects any bubble whose JSON is over 30 KB. Pending items carry
     # over day to day, so one bubble eventually overflowed and the reply/push
     # failed silently (400 "Too large flex message"). Split into several
@@ -3873,8 +4028,12 @@ def send_overdue_digest():
         push_flex_to(uid, alt_text, contents)
 
 scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
-scheduler.add_job(send_daily_digest, "cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
-scheduler.add_job(send_overdue_digest, "cron", hour=OVERDUE_HOUR, minute=OVERDUE_MINUTE)
+# Tag summaries are no longer pushed 1:1 automatically: the owner pulls them with
+# "สรุป" / "สรุป PM" / "สรุป BIM" / "สรุป REQ". Set TAG_AUTO_DIGEST=1 to bring
+# the old 18:00 digest + 08:00 overdue push back.
+if os.environ.get("TAG_AUTO_DIGEST", "0").strip().lower() in ("1", "true", "yes", "on"):
+    scheduler.add_job(send_daily_digest, "cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
+    scheduler.add_job(send_overdue_digest, "cron", hour=OVERDUE_HOUR, minute=OVERDUE_MINUTE)
 scheduler.add_job(scheduled_reply_followup, "cron", day_of_week=REMIND_DAYS_OF_WEEK,
                   hour=REMIND_HOUR, minute=REMIND_MINUTE)
 scheduler.start()
