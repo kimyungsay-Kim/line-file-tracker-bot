@@ -4236,6 +4236,8 @@ q.addEventListener('input',f);const p=new URLSearchParams(location.search).get('
 # "ลงชื่อ OT" / "ยกเลิกของฉัน" buttons + an @All line. Tapping a button sends a
 # postback; the bot records the tapper's LINE name (no friendship needed) and
 # replies one short line (free). Sign-up closes at OT_CUTOFF (default 17:00).
+# Wording: OT "until 20:00" -> the list is used to order box dinners (ข้าวกล่อง);
+# the bot speaks with ค่ะ/นะคะ.
 # "สรุปโอ" lists today's names (in a group: that group; 1:1: every group).
 # No automatic reminders (they would need Push quota): typing "โอ" again
 # (e.g. 16:40 / 16:50) re-posts the card + @All with the time left and the
@@ -4283,14 +4285,14 @@ def build_ot_card(work_date, count=None):
     d = work_date.isoformat()
     th = f"{work_date.day:02d}/{work_date.month:02d}/{work_date.year + 543}"
     body = [
-        flex_txt("🌙 ลงชื่อทำ OT วันนี้", weight="bold", size="lg", color=f"#{OT_COLOR}"),
+        flex_txt("🍱 ลงชื่อ OT วันนี้ (สั่งข้าวกล่อง)", weight="bold", size="lg", color=f"#{OT_COLOR}"),
         flex_txt(th, size="sm", color="#888888", margin="xs"),
         {"type": "separator", "margin": "md"},
-        flex_txt(f"OT ตั้งแต่ {OT_START_TEXT} น. เป็นต้นไป", size="md", margin="md", wrap=True),
+        flex_txt(f"ใครทำ OT ถึง {OT_START_TEXT} น. ลงชื่อไว้ เพื่อสั่งข้าวกล่องให้ค่ะ", size="md", margin="md", wrap=True),
         flex_txt(f"⏰ ปิดรับลงชื่อ {OT_CUTOFF} น.", size="sm", color="#C62828", margin="sm"),
     ]
     if count is not None:
-        body.append(flex_txt(f"ลงชื่อแล้ว {count} คน", size="sm", color="#555555", margin="sm"))
+        body.append(flex_txt(f"ลงชื่อแล้ว {count} คน (ข้าวกล่อง {count} กล่อง)", size="sm", color="#555555", margin="sm"))
     return {
         "type": "bubble",
         "body": {"type": "box", "layout": "vertical", "contents": body},
@@ -4312,7 +4314,7 @@ def _all_text(text):
 def handle_ot_open(event, group_id):
     today = bkk_today()
     if not ot_is_open(today):
-        reply(event.reply_token, f"ปิดรับลงชื่อ OT วันนี้แล้วครับ (ปิด {OT_CUTOFF} น.)\n"
+        reply(event.reply_token, f"ปิดรับลงชื่อ OT วันนี้แล้วค่ะ (ปิด {OT_CUTOFF} น.)\n"
                                  f"ดูรายชื่อ: พิมพ์ \"สรุปโอ\"")
         return
     rows = _ot_rows(group_id, today)
@@ -4320,14 +4322,16 @@ def handle_ot_open(event, group_id):
     h, m = _hm(OT_CUTOFF)
     mins_left = (h * 60 + m) - (now.hour * 60 + now.minute)
     if rows:  # typed again later in the day: remind + recap the list
-        text = (f"{{all}} ⏰ อีก {mins_left} นาที ปิดรับลงชื่อ OT ({OT_CUTOFF} น.)\n"
-                f"ใครทำ OT คืนนี้ ({OT_START_TEXT} น. เป็นต้นไป) ยังไม่ลงชื่อ กดในการ์ดด้านบนได้เลยครับ\n\n"
-                f"ทวนรายชื่อตอนนี้ {len(rows)} คน:\n{_ot_names_block(rows)}")
+        text = (f"{{all}} ⏰ อีก {mins_left} นาที ปิดรับลงชื่อ OT ({OT_CUTOFF} น.) ค่ะ\n"
+                f"ใครทำ OT ถึง {OT_START_TEXT} น. แล้วยังไม่ได้ลงชื่อ กดในการ์ดด้านบนได้เลยนะคะ "
+                f"จะได้สั่งข้าวกล่องให้ครบค่ะ 🍱\n\n"
+                f"ทวนรายชื่อตอนนี้ {len(rows)} คน (ข้าวกล่อง {len(rows)} กล่อง):\n{_ot_names_block(rows)}")
     else:
-        text = (f"{{all}} ใครทำ OT คืนนี้ ({OT_START_TEXT} น. เป็นต้นไป) "
-                f"กดปุ่ม \"ลงชื่อ OT\" ในการ์ดด้านบนได้เลยครับ ปิดรับ {OT_CUTOFF} น.")
+        text = (f"{{all}} วันนี้ใครทำ OT ถึง {OT_START_TEXT} น. รบกวนลงชื่อไว้ด้วยนะคะ "
+                f"จะได้สั่งข้าวกล่องให้ค่ะ 🍱\n"
+                f"กดปุ่ม \"ลงชื่อ OT\" ในการ์ดด้านบนได้เลยค่ะ ปิดรับ {OT_CUTOFF} น. นะคะ")
     _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token, "messages": [
-        {"type": "flex", "altText": "ลงชื่อทำ OT วันนี้",
+        {"type": "flex", "altText": "ลงชื่อ OT วันนี้ (สั่งข้าวกล่อง)",
          "contents": build_ot_card(today, len(rows) if rows else None)},
         _all_text(text),
     ]})
@@ -4347,8 +4351,8 @@ def handle_postback(event):
     except ValueError:
         return
     if not ot_is_open(work_date):
-        reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วครับ "
-                                 f"(ปิด {OT_CUTOFF} น.) แจ้งธุรการโดยตรงได้เลยครับ")
+        reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วค่ะ "
+                                 f"(ปิด {OT_CUTOFF} น.) แจ้งธุรการโดยตรงได้เลยนะคะ")
         return
     name = get_profile_name(group_id, user_id)
     remember_group_member(group_id, user_id, name)
@@ -4363,11 +4367,11 @@ def handle_postback(event):
                     "INSERT INTO ot_signups (group_id, work_date, user_id, display_name, signed_at) "
                     "VALUES (?,?,?,?,?)",
                     (group_id, work_date.isoformat(), user_id, name, bkk_now().isoformat()))
-            msg = "ลงชื่อไว้แล้วครับ" if existed else "ลงชื่อ OT แล้ว"
+            msg = "ลงชื่อไว้แล้วค่ะ" if existed else "ลงชื่อ OT แล้วค่ะ"
         else:
             conn.execute("DELETE FROM ot_signups WHERE group_id=? AND work_date=? AND user_id=?",
                          (group_id, work_date.isoformat(), user_id))
-            msg = "ยกเลิกลงชื่อ OT แล้ว"
+            msg = "ยกเลิกลงชื่อ OT แล้วค่ะ"
     finally:
         conn.close()
     total = len(_ot_rows(group_id, work_date))
@@ -4392,16 +4396,16 @@ def build_ot_summary_text(group_id, arg=""):
     try:
         work_date = _parse_ot_date(arg)
     except ValueError:
-        return "รูปแบบวันที่ไม่ถูกต้องครับ เช่น \"สรุปโอ\" หรือ \"สรุปโอ 10/11\""
+        return "รูปแบบวันที่ไม่ถูกต้องค่ะ เช่น \"สรุปโอ\" หรือ \"สรุปโอ 10/11\""
     th = f"{work_date.day:02d}/{work_date.month:02d}/{work_date.year + 543}"
     rows = _ot_rows(group_id, work_date)
     state = "เปิดรับอยู่" if ot_is_open(work_date) else "ปิดรับแล้ว"
     if group_id:
-        return (f"🌙 รายชื่อ OT {th} ({OT_START_TEXT} น. เป็นต้นไป)\n"
-                f"รวม {len(rows)} คน · {state}\n\n{_ot_names_block(rows)}")
+        return (f"🍱 รายชื่อ OT {th} (ถึง {OT_START_TEXT} น.)\n"
+                f"รวม {len(rows)} คน · ข้าวกล่อง {len(rows)} กล่อง · {state}\n\n{_ot_names_block(rows)}")
     if not rows:
-        return f"🌙 OT {th}: ยังไม่มีคนลงชื่อในกลุ่มไหนเลยครับ"
-    parts = [f"🌙 รายชื่อ OT {th} ทุกกลุ่ม · รวม {len(rows)} คน · {state}"]
+        return f"🍱 OT {th}: ยังไม่มีคนลงชื่อในกลุ่มไหนเลยค่ะ"
+    parts = [f"🍱 รายชื่อ OT {th} ทุกกลุ่ม · รวม {len(rows)} คน (ข้าวกล่อง {len(rows)} กล่อง) · {state}"]
     by_group = {}
     for r in rows:
         by_group.setdefault(r[0], []).append(r)
