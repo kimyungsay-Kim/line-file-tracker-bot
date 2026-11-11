@@ -788,6 +788,13 @@ def handle_text(event):
         except Exception:
             app.logger.exception("OT open failed")
         return
+    if text in OT_CLOSE_CMDS:
+        if source.user_id in (owner_ids() | TAGGED_USER_IDS):
+            try:
+                handle_ot_close(event, group_id)
+            except Exception:
+                app.logger.exception("OT close failed")
+        return
     if text.split(" ", 1)[0] in OT_SUMMARY_CMDS:
         try:
             reply(event.reply_token, build_ot_summary_text(
@@ -4244,6 +4251,9 @@ q.addEventListener('input',f);const p=new URLSearchParams(location.search).get('
 # names signed so far - still a free Reply.
 OT_OPEN_CMDS = ("โอ", "โอที", "OT", "ot", "ลงชื่อโอ", "ลงชื่อOT")
 OT_SUMMARY_CMDS = ("สรุปโอ", "สรุปโอที", "สรุปOT", "สรุปot", "รายชื่อโอ")
+# "ปิดโอ" (owner/admin, in the group): closes today's sign-up for that group
+# right away and replies @All with the final list + box-dinner count (free Reply).
+OT_CLOSE_CMDS = ("ปิดโอ", "ปิดโอที", "ปิดOT", "ปิดot", "ปิดรับโอ")
 OT_START_TEXT = os.environ.get("OT_START_TEXT", "20:00")
 OT_CUTOFF = os.environ.get("OT_CUTOFF", "17:00")
 OT_COLOR = "4527A0"
@@ -4252,9 +4262,14 @@ def _hm(s):
     h, m = s.split(":")
     return int(h), int(m)
 
-def ot_is_open(work_date, now=None):
+def _ot_closed_key(group_id, work_date):
+    return f"ot_closed_{work_date.isoformat()}_{group_id}"
+
+def ot_is_open(work_date, now=None, group_id=None):
     now = now or bkk_now()
     if work_date != now.date():
+        return False
+    if group_id and get_setting(_ot_closed_key(group_id, work_date), ""):
         return False
     h, m = _hm(OT_CUTOFF)
     return (now.hour, now.minute) < (h, m)
@@ -4313,7 +4328,7 @@ def _all_text(text):
 
 def handle_ot_open(event, group_id):
     today = bkk_today()
-    if not ot_is_open(today):
+    if not ot_is_open(today, group_id=group_id):
         reply(event.reply_token, f"ปิดรับลงชื่อ OT วันนี้แล้วค่ะ (ปิด {OT_CUTOFF} น.)\n"
                                  f"ดูรายชื่อ: พิมพ์ \"สรุปโอ\"")
         return
@@ -4336,6 +4351,23 @@ def handle_ot_open(event, group_id):
         _all_text(text),
     ]})
 
+def handle_ot_close(event, group_id):
+    """Owner/admin "ปิดโอ": close today's sign-up in this group now and post
+    the final list + box-dinner count with @All (free Reply)."""
+    today = bkk_today()
+    set_setting(_ot_closed_key(group_id, today), bkk_now().isoformat())
+    rows = _ot_rows(group_id, today)
+    th = f"{today.day:02d}/{today.month:02d}/{today.year + 543}"
+    if rows:
+        text = (f"{{all}} 🍱 ปิดรับลงชื่อ OT วันนี้ ({th}) แล้วค่ะ\n"
+                f"สรุปคนทำ OT ถึง {OT_START_TEXT} น. ทั้งหมด {len(rows)} คน "
+                f"สั่งข้าวกล่อง {len(rows)} กล่องนะคะ\n\n{_ot_names_block(rows)}\n\n"
+                f"ใครทำ OT แต่ยังไม่ได้ลงชื่อ แจ้งธุรการโดยตรงได้เลยค่ะ")
+    else:
+        text = (f"{{all}} 🍱 ปิดรับลงชื่อ OT วันนี้ ({th}) แล้วค่ะ\n"
+                f"วันนี้ไม่มีคนลงชื่อทำ OT ถึง {OT_START_TEXT} น. จึงไม่ได้สั่งข้าวกล่องนะคะ")
+    _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token, "messages": [_all_text(text)]})
+
 @handler.add(PostbackEvent)
 def handle_postback(event):
     data = event.postback.data or ""
@@ -4350,7 +4382,7 @@ def handle_postback(event):
         work_date = datetime.date.fromisoformat(params.get("d", ""))
     except ValueError:
         return
-    if not ot_is_open(work_date):
+    if not ot_is_open(work_date, group_id=group_id):
         reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วค่ะ "
                                  f"(ปิด {OT_CUTOFF} น.) แจ้งธุรการโดยตรงได้เลยนะคะ")
         return
@@ -4399,7 +4431,7 @@ def build_ot_summary_text(group_id, arg=""):
         return "รูปแบบวันที่ไม่ถูกต้องค่ะ เช่น \"สรุปโอ\" หรือ \"สรุปโอ 10/11\""
     th = f"{work_date.day:02d}/{work_date.month:02d}/{work_date.year + 543}"
     rows = _ot_rows(group_id, work_date)
-    state = "เปิดรับอยู่" if ot_is_open(work_date) else "ปิดรับแล้ว"
+    state = "เปิดรับอยู่" if ot_is_open(work_date, group_id=group_id) else "ปิดรับแล้ว"
     if group_id:
         return (f"🍱 รายชื่อ OT {th} (ถึง {OT_START_TEXT} น.)\n"
                 f"รวม {len(rows)} คน · ข้าวกล่อง {len(rows)} กล่อง · {state}\n\n{_ot_names_block(rows)}")
