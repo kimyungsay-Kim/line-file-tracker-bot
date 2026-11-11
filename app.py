@@ -25,7 +25,8 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent, ImageMessageContent,
-    FileMessageContent, VideoMessageContent, AudioMessageContent
+    FileMessageContent, VideoMessageContent, AudioMessageContent,
+    PostbackEvent
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -94,6 +95,17 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
 # ---------- Storage ----------
 SCHEMA_STATEMENTS = [
+    # OT sign-up (group "โอ" card): one row per person per group per day
+    """
+    CREATE TABLE IF NOT EXISTS ot_signups (
+        group_id TEXT,
+        work_date TEXT,
+        user_id TEXT,
+        display_name TEXT,
+        signed_at TEXT,
+        PRIMARY KEY (group_id, work_date, user_id)
+    )
+    """,
     # one row per "ส่ง" of a Request PB list, so each announcement carries a
     # searchable round code (e.g. PB-291069-2 = 2nd round on 29/10/69)
     """
@@ -706,6 +718,9 @@ def handle_text(event):
                 reply(event.reply_token, alt_text)
             else:
                 reply_flex(event.reply_token, alt_text, contents)
+        elif text.split(" ", 1)[0] in OT_SUMMARY_CMDS:
+            reply(event.reply_token, build_ot_summary_text(
+                None, text.split(" ", 1)[1] if " " in text else ""))
         elif text in ("id", "whoami", "ไอดี"):
             reply(event.reply_token, f"user_id ของคุณคือ:\n{source.user_id}")
         elif text in ("โหลดแล้ว", "✅", "👍"):
@@ -765,6 +780,21 @@ def handle_text(event):
 
     group_id = source.group_id
     remember_group_member(group_id, source.user_id)
+
+    # OT sign-up: anyone in any group with the bot - free Reply, @All
+    if text in OT_OPEN_CMDS:
+        try:
+            handle_ot_open(event, group_id)
+        except Exception:
+            app.logger.exception("OT open failed")
+        return
+    if text.split(" ", 1)[0] in OT_SUMMARY_CMDS:
+        try:
+            reply(event.reply_token, build_ot_summary_text(
+                group_id, text.split(" ", 1)[1] if " " in text else ""))
+        except Exception:
+            app.logger.exception("OT summary failed")
+        return
 
     # utility: anyone can type "groupid" in a group to get its ID for setup
     if text.lower() in ("groupid", "ไอดีกลุ่ม"):
@@ -4200,6 +4230,209 @@ none.classList.toggle('hide',n>0||!rs.length)}}
 q.addEventListener('input',f);const p=new URLSearchParams(location.search).get('q');if(p){{q.value=p;f()}}
 </script></body></html>"""
     return Response(page, mimetype="text/html")
+
+# ---------- OT sign-up (group "โอ") ----------
+# Anyone types "โอ" in a group that has the bot -> free Reply: a Flex card with
+# "ลงชื่อ OT" / "ยกเลิกของฉัน" buttons + an @All line. Tapping a button sends a
+# postback; the bot records the tapper's LINE name (no friendship needed) and
+# replies one short line (free). Sign-up closes at OT_CUTOFF (default 17:00).
+# "สรุปโอ" lists today's names (in a group: that group; 1:1: every group).
+# No automatic reminders (they would need Push quota): typing "โอ" again
+# (e.g. 16:40 / 16:50) re-posts the card + @All with the time left and the
+# names signed so far - still a free Reply.
+OT_OPEN_CMDS = ("โอ", "โอที", "OT", "ot", "ลงชื่อโอ", "ลงชื่อOT")
+OT_SUMMARY_CMDS = ("สรุปโอ", "สรุปโอที", "สรุปOT", "สรุปot", "รายชื่อโอ")
+OT_START_TEXT = os.environ.get("OT_START_TEXT", "20:00")
+OT_CUTOFF = os.environ.get("OT_CUTOFF", "17:00")
+OT_COLOR = "4527A0"
+
+def _hm(s):
+    h, m = s.split(":")
+    return int(h), int(m)
+
+def ot_is_open(work_date, now=None):
+    now = now or bkk_now()
+    if work_date != now.date():
+        return False
+    h, m = _hm(OT_CUTOFF)
+    return (now.hour, now.minute) < (h, m)
+
+def _ot_rows(group_id, work_date):
+    conn = db()
+    try:
+        if group_id:
+            rows = conn.execute(
+                "SELECT group_id, display_name, signed_at FROM ot_signups "
+                "WHERE group_id = ? AND work_date = ? ORDER BY signed_at",
+                (group_id, work_date.isoformat())).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT group_id, display_name, signed_at FROM ot_signups "
+                "WHERE work_date = ? ORDER BY group_id, signed_at",
+                (work_date.isoformat(),)).fetchall()
+    finally:
+        conn.close()
+    return [tuple(r) for r in rows]
+
+def _ot_names_block(rows):
+    if not rows:
+        return "ยังไม่มีคนลงชื่อ"
+    return "\n".join(f"{i}. {r[1]}" for i, r in enumerate(rows, 1))
+
+def build_ot_card(work_date, count=None):
+    d = work_date.isoformat()
+    th = f"{work_date.day:02d}/{work_date.month:02d}/{work_date.year + 543}"
+    body = [
+        flex_txt("🌙 ลงชื่อทำ OT วันนี้", weight="bold", size="lg", color=f"#{OT_COLOR}"),
+        flex_txt(th, size="sm", color="#888888", margin="xs"),
+        {"type": "separator", "margin": "md"},
+        flex_txt(f"OT ตั้งแต่ {OT_START_TEXT} น. เป็นต้นไป", size="md", margin="md", wrap=True),
+        flex_txt(f"⏰ ปิดรับลงชื่อ {OT_CUTOFF} น.", size="sm", color="#C62828", margin="sm"),
+    ]
+    if count is not None:
+        body.append(flex_txt(f"ลงชื่อแล้ว {count} คน", size="sm", color="#555555", margin="sm"))
+    return {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "contents": body},
+        "footer": {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "color": f"#{OT_COLOR}", "height": "sm",
+             "action": {"type": "postback", "label": "✋ ลงชื่อ OT",
+                        "data": f"ot=join&d={d}", "displayText": "✋ ลงชื่อ OT"}},
+            {"type": "button", "style": "secondary", "height": "sm",
+             "action": {"type": "postback", "label": "ยกเลิกของฉัน",
+                        "data": f"ot=leave&d={d}", "displayText": "ยกเลิกลงชื่อ OT"}},
+        ]},
+    }
+
+def _all_text(text):
+    """textV2 message whose {all} becomes a real @All mention."""
+    return {"type": "textV2", "text": text,
+            "substitution": {"all": {"type": "mention", "mentionee": {"type": "all"}}}}
+
+def handle_ot_open(event, group_id):
+    today = bkk_today()
+    if not ot_is_open(today):
+        reply(event.reply_token, f"ปิดรับลงชื่อ OT วันนี้แล้วครับ (ปิด {OT_CUTOFF} น.)\n"
+                                 f"ดูรายชื่อ: พิมพ์ \"สรุปโอ\"")
+        return
+    rows = _ot_rows(group_id, today)
+    now = bkk_now()
+    h, m = _hm(OT_CUTOFF)
+    mins_left = (h * 60 + m) - (now.hour * 60 + now.minute)
+    if rows:  # typed again later in the day: remind + recap the list
+        text = (f"{{all}} ⏰ อีก {mins_left} นาที ปิดรับลงชื่อ OT ({OT_CUTOFF} น.)\n"
+                f"ใครทำ OT คืนนี้ ({OT_START_TEXT} น. เป็นต้นไป) ยังไม่ลงชื่อ กดในการ์ดด้านบนได้เลยครับ\n\n"
+                f"ทวนรายชื่อตอนนี้ {len(rows)} คน:\n{_ot_names_block(rows)}")
+    else:
+        text = (f"{{all}} ใครทำ OT คืนนี้ ({OT_START_TEXT} น. เป็นต้นไป) "
+                f"กดปุ่ม \"ลงชื่อ OT\" ในการ์ดด้านบนได้เลยครับ ปิดรับ {OT_CUTOFF} น.")
+    _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token, "messages": [
+        {"type": "flex", "altText": "ลงชื่อทำ OT วันนี้",
+         "contents": build_ot_card(today, len(rows) if rows else None)},
+        _all_text(text),
+    ]})
+
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    data = event.postback.data or ""
+    if not data.startswith("ot="):
+        return
+    params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
+    source = event.source
+    if source.type != "group":
+        return
+    group_id, user_id = source.group_id, source.user_id
+    try:
+        work_date = datetime.date.fromisoformat(params.get("d", ""))
+    except ValueError:
+        return
+    if not ot_is_open(work_date):
+        reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วครับ "
+                                 f"(ปิด {OT_CUTOFF} น.) แจ้งธุรการโดยตรงได้เลยครับ")
+        return
+    name = get_profile_name(group_id, user_id)
+    remember_group_member(group_id, user_id, name)
+    conn = db()
+    try:
+        if params.get("ot") == "join":
+            existed = conn.execute(
+                "SELECT 1 FROM ot_signups WHERE group_id=? AND work_date=? AND user_id=?",
+                (group_id, work_date.isoformat(), user_id)).fetchone()
+            if not existed:
+                conn.execute(
+                    "INSERT INTO ot_signups (group_id, work_date, user_id, display_name, signed_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (group_id, work_date.isoformat(), user_id, name, bkk_now().isoformat()))
+            msg = "ลงชื่อไว้แล้วครับ" if existed else "ลงชื่อ OT แล้ว"
+        else:
+            conn.execute("DELETE FROM ot_signups WHERE group_id=? AND work_date=? AND user_id=?",
+                         (group_id, work_date.isoformat(), user_id))
+            msg = "ยกเลิกลงชื่อ OT แล้ว"
+    finally:
+        conn.close()
+    total = len(_ot_rows(group_id, work_date))
+    reply(event.reply_token, f"✓ {name} {msg} (รวม {total} คน)")
+
+def _parse_ot_date(arg):
+    arg = (arg or "").strip()
+    if not arg:
+        return bkk_today()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", arg)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else bkk_today().year
+        if year < 100:
+            year += 2500 if year > 50 else 2000
+        if year > 2400:
+            year -= 543
+        return datetime.date(year, month, day)
+    return datetime.date.fromisoformat(arg)
+
+def build_ot_summary_text(group_id, arg=""):
+    try:
+        work_date = _parse_ot_date(arg)
+    except ValueError:
+        return "รูปแบบวันที่ไม่ถูกต้องครับ เช่น \"สรุปโอ\" หรือ \"สรุปโอ 10/11\""
+    th = f"{work_date.day:02d}/{work_date.month:02d}/{work_date.year + 543}"
+    rows = _ot_rows(group_id, work_date)
+    state = "เปิดรับอยู่" if ot_is_open(work_date) else "ปิดรับแล้ว"
+    if group_id:
+        return (f"🌙 รายชื่อ OT {th} ({OT_START_TEXT} น. เป็นต้นไป)\n"
+                f"รวม {len(rows)} คน · {state}\n\n{_ot_names_block(rows)}")
+    if not rows:
+        return f"🌙 OT {th}: ยังไม่มีคนลงชื่อในกลุ่มไหนเลยครับ"
+    parts = [f"🌙 รายชื่อ OT {th} ทุกกลุ่ม · รวม {len(rows)} คน · {state}"]
+    by_group = {}
+    for r in rows:
+        by_group.setdefault(r[0], []).append(r)
+    for gid, grows in by_group.items():
+        parts.append(f"\n【{get_group_name(gid)}】 {len(grows)} คน\n{_ot_names_block(grows)}")
+    parts.append(f"\nไฟล์ CSV: {SERVICE_BASE_URL}/report/ot.csv?date={work_date.isoformat()}"
+                 + (f"&key={REPORT_ACCESS_KEY}" if REPORT_ACCESS_KEY else ""))
+    return "\n".join(parts)
+
+@app.route("/report/ot.csv", methods=["GET"])
+def report_ot_csv():
+    if REPORT_ACCESS_KEY and request.args.get("key", "") != REPORT_ACCESS_KEY:
+        abort(403)
+    try:
+        work_date = _parse_ot_date(request.args.get("date", ""))
+    except ValueError:
+        abort(400, "date must be YYYY-MM-DD")
+    rows = _ot_rows(None, work_date)
+    names = {}
+    buf = io.StringIO()
+    buf.write("﻿")
+    w = csv.writer(buf)
+    w.writerow(["วันที่", "กลุ่ม", "ลำดับ", "ชื่อ LINE", "เวลาลงชื่อ"])
+    seq = {}
+    for gid, name, signed_at in rows:
+        if gid not in names:
+            names[gid] = get_group_name(gid)
+        seq[gid] = seq.get(gid, 0) + 1
+        w.writerow([work_date.isoformat(), names[gid], seq[gid], name, (signed_at or "")[11:16]])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="ot_{work_date.isoformat()}.csv"'})
 
 @app.route("/", methods=["GET"])
 def health():
