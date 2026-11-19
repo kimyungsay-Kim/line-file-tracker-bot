@@ -675,6 +675,13 @@ def handle_text(event):
             reply(event.reply_token, handle_track_backfill(text))
             return
 
+        # free-text announcement draft (checked before the "|" paste parser,
+        # so an announcement may contain "|")
+        announce_reply = handle_announce_draft_command(user_id, text)
+        if announce_reply is not None:
+            reply(event.reply_token, announce_reply)
+            return
+
         if "|" in text:
             parsed_items = parse_inspection_paste(text)
             if parsed_items:
@@ -838,6 +845,13 @@ def handle_text(event):
             handle_group_announce(event, group_id)
         except Exception:
             app.logger.exception("group announce failed")
+        return
+    if text in ANNOUNCE_SEND_CMDS:
+        if source.user_id in owner_ids():
+            try:
+                handle_group_announce_send(event, group_id)
+            except Exception:
+                app.logger.exception("free-text announce failed")
         return
     if text in GROUP_FOLLOWUP_CMDS and source.user_id in owner_ids():
         try:
@@ -1430,6 +1444,70 @@ def handle_group_announce(event, group_id):
 
 def owner_ids():
     return {OWNER_USER_ID} if OWNER_USER_ID else set(TAGGED_USER_IDS)
+
+# --- Free-text announcement: draft 1:1, release in a group (free Reply) ---
+#   1:1   "ประกาศ <ข้อความ>"  -> save draft + show preview
+#   1:1   "ประกาศ"           -> show current draft
+#   1:1   "ลบประกาศ"         -> delete draft
+#   group "ส่งประกาศ"        -> (owner only) bot replies with the draft + @All,
+#                               then the draft is cleared. Free: Reply, not Push.
+ANNOUNCE_DRAFT_CMD = "ประกาศ"
+ANNOUNCE_CLEAR_CMDS = ("ลบประกาศ", "ยกเลิกประกาศ")
+ANNOUNCE_SEND_CMDS = ("ส่งประกาศ",)
+ANNOUNCE_MAX_CHARS = 4900  # textV2 limit is 5000
+
+def _announce_key(user_id):
+    return f"announce_draft:{user_id}"
+
+def get_announce_draft(user_id):
+    return get_setting(_announce_key(user_id), "")
+
+def _announce_message(body):
+    # "{" / "}" mark substitution keys in textV2 - swap any in the user's own
+    # text for full-width braces so they show as typed instead of erroring
+    safe = body.replace("{", "｛").replace("}", "｝")
+    return _all_text("{all}\n" + safe)
+
+def handle_announce_draft_command(user_id, text):
+    """1:1 commands for the free-text announcement. Returns the reply text, or
+    None when the text isn't one of these commands."""
+    if text in ANNOUNCE_CLEAR_CMDS:
+        if user_id not in owner_ids():
+            return None
+        set_setting(_announce_key(user_id), "")
+        return "ลบร่างประกาศแล้วครับ"
+    if not text.startswith(ANNOUNCE_DRAFT_CMD):
+        return None
+    rest = text[len(ANNOUNCE_DRAFT_CMD):]
+    if rest and not rest[0].isspace():
+        return None  # e.g. "ประกาศอื่นๆ" - not this command
+    if user_id not in owner_ids():
+        return None
+    body = rest.strip()
+    if not body:
+        draft = get_announce_draft(user_id)
+        if not draft:
+            return ('ยังไม่มีร่างประกาศครับ\nพิมพ์ "ประกาศ ข้อความที่ต้องการ" '
+                    '(ขึ้นบรรทัดใหม่ได้) แล้วไปพิมพ์ "ส่งประกาศ" ในกลุ่ม')
+        return (f"ร่างประกาศที่รอส่ง:\n────────\n@All\n{draft}\n────────\n"
+                'ไปพิมพ์ "ส่งประกาศ" ในกลุ่มที่ต้องการ (ฟรี ไม่กินโควตา) | ลบร่าง: "ลบประกาศ"')
+    if len(body) > ANNOUNCE_MAX_CHARS:
+        return f"ข้อความยาวเกินไปครับ ({len(body)} ตัวอักษร) ใส่ได้ไม่เกิน {ANNOUNCE_MAX_CHARS}"
+    set_setting(_announce_key(user_id), body)
+    return (f"บันทึกร่างประกาศแล้วครับ ตัวอย่างที่จะขึ้นในกลุ่ม:\n────────\n@All\n{body}\n────────\n"
+            'ไปพิมพ์ "ส่งประกาศ" ในกลุ่มที่ต้องการ (ฟรี ไม่กินโควตา)\n'
+            'แก้ไข: พิมพ์ "ประกาศ ..." ใหม่ทับได้เลย | ลบร่าง: "ลบประกาศ"')
+
+def handle_group_announce_send(event, group_id):
+    """Group "ส่งประกาศ" (owner only): replies with the owner's draft + @All.
+    No draft -> silently does nothing in the group."""
+    sender_id = event.source.user_id
+    body = get_announce_draft(sender_id)
+    if not body:
+        return
+    _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token,
+                                "messages": [_announce_message(body)]})
+    set_setting(_announce_key(sender_id), "")
 
 # --- CO: the one person tagged on Assignee (area handover) lists ---
 # Set in the group by the owner: "ตั้งผู้รับผิดชอบ CO @ชื่อ" (confirmation 1:1).
