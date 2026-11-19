@@ -788,7 +788,13 @@ def handle_text(event):
     group_id = source.group_id
     remember_group_member(group_id, source.user_id)
 
-    # OT sign-up: anyone in any group with the bot - free Reply, @All
+    # OT sign-up commands (โอ / ปิดโอ / สรุปโอ): owner only - anyone else
+    # typing them is silently ignored. Signing up itself stays open to everyone
+    # through the buttons on the OT post (postback). Free Reply, @All.
+    is_ot_cmd = (text in OT_OPEN_CMDS or text in OT_CLOSE_CMDS
+                 or text.split(" ", 1)[0] in OT_SUMMARY_CMDS)
+    if is_ot_cmd and source.user_id not in owner_ids():
+        return
     if text in OT_OPEN_CMDS:
         try:
             handle_ot_open(event, group_id)
@@ -796,11 +802,10 @@ def handle_text(event):
             app.logger.exception("OT open failed")
         return
     if text in OT_CLOSE_CMDS:
-        if source.user_id in (owner_ids() | TAGGED_USER_IDS):
-            try:
-                handle_ot_close(event, group_id)
-            except Exception:
-                app.logger.exception("OT close failed")
+        try:
+            handle_ot_close(event, group_id)
+        except Exception:
+            app.logger.exception("OT close failed")
         return
     if text.split(" ", 1)[0] in OT_SUMMARY_CMDS:
         try:
