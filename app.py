@@ -792,8 +792,15 @@ def handle_text(event):
     # typing them is silently ignored. Signing up itself stays open to everyone
     # through the buttons on the OT post (postback). Free Reply, @All.
     is_ot_cmd = (text in OT_OPEN_CMDS or text in OT_CLOSE_CMDS
-                 or text.split(" ", 1)[0] in OT_SUMMARY_CMDS)
+                 or text.split(" ", 1)[0] in OT_SUMMARY_CMDS
+                 or text.split(" ", 1)[0] in OT_EXTEND_CMDS)
     if is_ot_cmd and source.user_id not in owner_ids():
+        return
+    if text.split(" ", 1)[0] in OT_EXTEND_CMDS:
+        try:
+            handle_ot_extend(event, group_id, text.split(" ", 1)[1] if " " in text else "")
+        except Exception:
+            app.logger.exception("OT extend failed")
         return
     if text in OT_OPEN_CMDS:
         try:
@@ -4337,6 +4344,9 @@ OT_SUMMARY_CMDS = ("สรุปโอ", "สรุปโอที", "สรุ�
 # "ปิดโอ" (owner/admin, in the group): closes today's sign-up for that group
 # right away and replies @All with the final list + box-dinner count (free Reply).
 OT_CLOSE_CMDS = ("ปิดโอ", "ปิดโอที", "ปิดOT", "ปิดot", "ปิดรับโอ")
+# "ต่อโอ 17:30" (owner, in the group): extends today's sign-up deadline for that
+# group (reopens it if already closed) and re-posts the card + @All (free Reply).
+OT_EXTEND_CMDS = ("ต่อโอ", "ต่อโอที", "ต่อOT", "ต่อot", "ขยายโอ", "ต่อเวลาโอ")
 OT_START_TEXT = os.environ.get("OT_START_TEXT", "20:00")
 OT_CUTOFF = os.environ.get("OT_CUTOFF", "17:00")
 OT_COLOR = "4527A0"
@@ -4348,13 +4358,36 @@ def _hm(s):
 def _ot_closed_key(group_id, work_date):
     return f"ot_closed_{work_date.isoformat()}_{group_id}"
 
+def _ot_cutoff_key(group_id, work_date):
+    return f"ot_cutoff_{work_date.isoformat()}_{group_id}"
+
+def ot_cutoff_for(group_id, work_date):
+    """Today's sign-up deadline for this group: a "ต่อโอ" extension wins,
+    otherwise the default OT_CUTOFF."""
+    if group_id:
+        v = get_setting(_ot_cutoff_key(group_id, work_date), "")
+        if v:
+            return v
+    return OT_CUTOFF
+
+def parse_hhmm(raw):
+    """'17:30' / '17.30' / '1730' / '18' -> '17:30' (None if not a valid time)."""
+    t = re.sub(r"\s*น\.?$", "", (raw or "").strip()).replace(".", ":").strip()
+    m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?", t)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    if h > 23 or mi > 59:
+        return None
+    return f"{h:02d}:{mi:02d}"
+
 def ot_is_open(work_date, now=None, group_id=None):
     now = now or bkk_now()
     if work_date != now.date():
         return False
     if group_id and get_setting(_ot_closed_key(group_id, work_date), ""):
         return False
-    h, m = _hm(OT_CUTOFF)
+    h, m = _hm(ot_cutoff_for(group_id, work_date))
     return (now.hour, now.minute) < (h, m)
 
 def _ot_rows(group_id, work_date):
@@ -4379,7 +4412,8 @@ def _ot_names_block(rows):
         return "ยังไม่มีคนลงชื่อ"
     return "\n".join(f"{i}. {r[1]}" for i, r in enumerate(rows, 1))
 
-def build_ot_card(work_date, count=None):
+def build_ot_card(work_date, count=None, cutoff=None):
+    cutoff = cutoff or OT_CUTOFF
     d = work_date.isoformat()
     th = f"{work_date.day:02d}/{work_date.month:02d}/{work_date.year + 543}"
     body = [
@@ -4387,7 +4421,7 @@ def build_ot_card(work_date, count=None):
         flex_txt(th, size="sm", color="#888888", margin="xs"),
         {"type": "separator", "margin": "md"},
         flex_txt(f"ใครทำ OT ถึง {OT_START_TEXT} น. ลงชื่อไว้ เพื่อสั่งข้าวกล่องให้ค่ะ", size="md", margin="md", wrap=True),
-        flex_txt(f"⏰ ปิดรับลงชื่อ {OT_CUTOFF} น.", size="sm", color="#C62828", margin="sm"),
+        flex_txt(f"⏰ ปิดรับลงชื่อ {cutoff} น.", size="sm", color="#C62828", margin="sm"),
     ]
     if count is not None:
         body.append(flex_txt(f"ลงชื่อแล้ว {count} คน (ข้าวกล่อง {count} กล่อง)", size="sm", color="#555555", margin="sm"))
@@ -4409,30 +4443,52 @@ def _all_text(text):
     return {"type": "textV2", "text": text,
             "substitution": {"all": {"type": "mention", "mentionee": {"type": "all"}}}}
 
-def handle_ot_open(event, group_id):
+def handle_ot_open(event, group_id, extended=False):
     today = bkk_today()
+    cutoff = ot_cutoff_for(group_id, today)
     if not ot_is_open(today, group_id=group_id):
-        reply(event.reply_token, f"ปิดรับลงชื่อ OT วันนี้แล้วค่ะ (ปิด {OT_CUTOFF} น.)\n"
+        reply(event.reply_token, f"ปิดรับลงชื่อ OT วันนี้แล้วค่ะ (ปิด {cutoff} น.)\n"
                                  f"ดูรายชื่อ: พิมพ์ \"สรุปโอ\"")
         return
     rows = _ot_rows(group_id, today)
     now = bkk_now()
-    h, m = _hm(OT_CUTOFF)
+    h, m = _hm(cutoff)
     mins_left = (h * 60 + m) - (now.hour * 60 + now.minute)
-    if rows:  # typed again later in the day: remind + recap the list
-        text = (f"{{all}} ⏰ อีก {mins_left} นาที ปิดรับลงชื่อ OT ({OT_CUTOFF} น.) ค่ะ\n"
+    if extended:
+        text = (f"{{all}} ⏰ ขยายเวลาลงชื่อ OT วันนี้ถึง {cutoff} น. ค่ะ\n"
+                f"ใครทำ OT ถึง {OT_START_TEXT} น. แล้วยังไม่ได้ลงชื่อ กดปุ่ม \"ลงชื่อ OT\" ในการ์ดด้านบนได้เลยนะคะ 🍱")
+        if rows:
+            text += f"\n\nทวนรายชื่อตอนนี้ {len(rows)} คน (ข้าวกล่อง {len(rows)} กล่อง):\n{_ot_names_block(rows)}"
+    elif rows:  # typed again later in the day: remind + recap the list
+        text = (f"{{all}} ⏰ อีก {mins_left} นาที ปิดรับลงชื่อ OT ({cutoff} น.) ค่ะ\n"
                 f"ใครทำ OT ถึง {OT_START_TEXT} น. แล้วยังไม่ได้ลงชื่อ กดในการ์ดด้านบนได้เลยนะคะ "
                 f"จะได้สั่งข้าวกล่องให้ครบค่ะ 🍱\n\n"
                 f"ทวนรายชื่อตอนนี้ {len(rows)} คน (ข้าวกล่อง {len(rows)} กล่อง):\n{_ot_names_block(rows)}")
     else:
         text = (f"{{all}} วันนี้ใครทำ OT ถึง {OT_START_TEXT} น. รบกวนลงชื่อไว้ด้วยนะคะ "
                 f"จะได้สั่งข้าวกล่องให้ค่ะ 🍱\n"
-                f"กดปุ่ม \"ลงชื่อ OT\" ในการ์ดด้านบนได้เลยค่ะ ปิดรับ {OT_CUTOFF} น. นะคะ")
+                f"กดปุ่ม \"ลงชื่อ OT\" ในการ์ดด้านบนได้เลยค่ะ ปิดรับ {cutoff} น. นะคะ")
     _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token, "messages": [
         {"type": "flex", "altText": "ลงชื่อ OT วันนี้ (สั่งข้าวกล่อง)",
-         "contents": build_ot_card(today, len(rows) if rows else None)},
+         "contents": build_ot_card(today, len(rows) if rows else None, cutoff)},
         _all_text(text),
     ]})
+
+def handle_ot_extend(event, group_id, arg):
+    """Owner "ต่อโอ 17:30": new deadline for today in this group (reopens a
+    closed sign-up), then re-posts the card + @All."""
+    new_cutoff = parse_hhmm(arg)
+    now = bkk_now()
+    if not new_cutoff:
+        reply(event.reply_token, "ใส่เวลาด้วยนะคะ เช่น \"ต่อโอ 17:30\"")
+        return
+    if _hm(new_cutoff) <= (now.hour, now.minute):
+        reply(event.reply_token, f"เวลา {new_cutoff} น. ผ่านไปแล้วค่ะ ใส่เวลาที่ยังมาไม่ถึง เช่น \"ต่อโอ 17:30\"")
+        return
+    today = bkk_today()
+    set_setting(_ot_cutoff_key(group_id, today), new_cutoff)
+    set_setting(_ot_closed_key(group_id, today), "")
+    handle_ot_open(event, group_id, extended=True)
 
 def handle_ot_close(event, group_id):
     """Owner/admin "ปิดโอ": close today's sign-up in this group now and post
@@ -4467,7 +4523,7 @@ def handle_postback(event):
         return
     if not ot_is_open(work_date, group_id=group_id):
         reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วค่ะ "
-                                 f"(ปิด {OT_CUTOFF} น.) แจ้งธุรการโดยตรงได้เลยนะคะ")
+                                 f"(ปิด {ot_cutoff_for(group_id, work_date)} น.) แจ้งธุรการโดยตรงได้เลยนะคะ")
         return
     name = get_profile_name(group_id, user_id)
     remember_group_member(group_id, user_id, name)
