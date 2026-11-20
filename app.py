@@ -4407,10 +4407,32 @@ def _ot_rows(group_id, work_date):
         conn.close()
     return [tuple(r) for r in rows]
 
+def _ot_late_threshold(group_id, work_date):
+    """Sign-ups at/after this moment count as late (ลงเพิ่มหลังปิดรับ): the
+    "ปิดโอ" time if the owner closed early, otherwise that day's deadline."""
+    closed_at = get_setting(_ot_closed_key(group_id, work_date), "")
+    if closed_at:
+        return closed_at[:16]
+    return f"{work_date.isoformat()}T{ot_cutoff_for(group_id, work_date)}"
+
+def _ot_is_late(row, cache=None):
+    gid, signed_at = row[0], (row[2] or "")
+    if not signed_at:
+        return False
+    key = (gid, signed_at[:10])
+    if cache is None or key not in cache:
+        th = _ot_late_threshold(gid, datetime.date.fromisoformat(signed_at[:10]))
+        if cache is None:
+            return signed_at[:16] >= th
+        cache[key] = th
+    return signed_at[:16] >= cache[key]
+
 def _ot_names_block(rows):
     if not rows:
         return "ยังไม่มีคนลงชื่อ"
-    return "\n".join(f"{i}. {r[1]}" for i, r in enumerate(rows, 1))
+    cache = {}
+    return "\n".join(f"{i}. {r[1]}" + (" (ลงเพิ่มหลังปิดรับ)" if _ot_is_late(r, cache) else "")
+                     for i, r in enumerate(rows, 1))
 
 def build_ot_card(work_date, count=None, cutoff=None):
     cutoff = cutoff or OT_CUTOFF
@@ -4521,9 +4543,12 @@ def handle_postback(event):
         work_date = datetime.date.fromisoformat(params.get("d", ""))
     except ValueError:
         return
-    if not ot_is_open(work_date, group_id=group_id):
+    # after the deadline (or "ปิดโอ") the same day, sign-ups are still taken
+    # as late additions and the bot replies with the updated summary
+    late = not ot_is_open(work_date, group_id=group_id)
+    if late and work_date != bkk_today():
         reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วค่ะ "
-                                 f"(ปิด {ot_cutoff_for(group_id, work_date)} น.) แจ้งธุรการโดยตรงได้เลยนะคะ")
+                                 f"แจ้งธุรการโดยตรงได้เลยนะคะ")
         return
     name = get_profile_name(group_id, user_id)
     remember_group_member(group_id, user_id, name)
@@ -4545,8 +4570,18 @@ def handle_postback(event):
             msg = "ยกเลิกลงชื่อ OT แล้วค่ะ"
     finally:
         conn.close()
-    total = len(_ot_rows(group_id, work_date))
-    reply(event.reply_token, f"✓ {name} {msg} (รวม {total} คน)")
+    rows = _ot_rows(group_id, work_date)
+    total = len(rows)
+    if not late:
+        reply(event.reply_token, f"✓ {name} {msg} (รวม {total} คน)")
+        return
+    late_names = [r[1] for r in rows if _ot_is_late(r)]
+    head = (f"✓ {name} ลงชื่อเพิ่มหลังปิดรับแล้วค่ะ" if params.get("ot") == "join" and not existed
+            else f"✓ {name} {msg}")
+    text = (f"{head}\n🍱 สรุปใหม่: รวม {total} คน · ข้าวกล่อง {total} กล่อง")
+    if late_names:
+        text += f"\nลงเพิ่มหลังปิดรับ {len(late_names)} คน: " + ", ".join(late_names)
+    reply(event.reply_token, text)
 
 def _parse_ot_date(arg):
     arg = (arg or "").strip()
