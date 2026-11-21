@@ -793,8 +793,15 @@ def handle_text(event):
     # through the buttons on the OT post (postback). Free Reply, @All.
     is_ot_cmd = (text in OT_OPEN_CMDS or text in OT_CLOSE_CMDS
                  or text.split(" ", 1)[0] in OT_SUMMARY_CMDS
-                 or text.split(" ", 1)[0] in OT_EXTEND_CMDS)
+                 or text.split(" ", 1)[0] in OT_EXTEND_CMDS
+                 or text.split(None, 1)[0] in OT_CANCEL_CMDS)
     if is_ot_cmd and source.user_id not in owner_ids():
+        return
+    if text.split(None, 1)[0] in OT_CANCEL_CMDS:
+        try:
+            handle_ot_cancel(event, group_id)
+        except Exception:
+            app.logger.exception("OT cancel failed")
         return
     if text.split(" ", 1)[0] in OT_EXTEND_CMDS:
         try:
@@ -4376,6 +4383,10 @@ OT_CLOSE_CMDS = ("ปิดโอ", "ปิดโอที", "ปิดOT", "ป
 # "ต่อโอ 17:30" (owner, in the group): extends today's sign-up deadline for that
 # group (reopens it if already closed) and re-posts the card + @All (free Reply).
 OT_EXTEND_CMDS = ("ต่อโอ", "ต่อโอที", "ต่อOT", "ต่อot", "ขยายโอ", "ต่อเวลาโอ")
+# "ยกเลิกโอ" (owner, in the group): cancels today's OT in that group - clears the
+#   list, blocks further sign-ups, tells everyone @All. "ต่อโอ HH:MM" reopens.
+# "ยกเลิกโอ @ชื่อ" (or "ยกเลิกโอ ชื่อ"): removes just those people from today's list.
+OT_CANCEL_CMDS = ("ยกเลิกโอ", "ยกเลิกโอที", "ยกเลิกOT", "ยกเลิกot")
 OT_START_TEXT = os.environ.get("OT_START_TEXT", "20:00")
 OT_CUTOFF = os.environ.get("OT_CUTOFF", "17:00")
 OT_COLOR = "4527A0"
@@ -4539,7 +4550,70 @@ def handle_ot_extend(event, group_id, arg):
     today = bkk_today()
     set_setting(_ot_cutoff_key(group_id, today), new_cutoff)
     set_setting(_ot_closed_key(group_id, today), "")
+    set_setting(_ot_cancelled_key(group_id, today), "")
     handle_ot_open(event, group_id, extended=True)
+
+def _ot_cancelled_key(group_id, work_date):
+    return f"ot_cancelled_{work_date.isoformat()}_{group_id}"
+
+def ot_is_cancelled(group_id, work_date):
+    return bool(get_setting(_ot_cancelled_key(group_id, work_date), ""))
+
+def handle_ot_cancel(event, group_id):
+    """Owner "ยกเลิกโอ": no args -> cancel today's OT in this group;
+    with @mentions / names -> remove just those people from today's list."""
+    today = bkk_today()
+    msg = event.message
+    raw = msg.text or ""
+    mention = getattr(msg, "mention", None)
+    tagged_ids = [m.user_id for m in (getattr(mention, "mentionees", None) or [])
+                  if getattr(m, "user_id", None)]
+    arg = strip_mentions(raw, mention).split(None, 1)
+    arg = arg[1].strip() if len(arg) > 1 else ""
+    has_mention = bool(getattr(mention, "mentionees", None)) or "@" in raw
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT user_id, display_name FROM ot_signups WHERE group_id = ? AND work_date = ?",
+            (group_id, today.isoformat())).fetchall()
+        rows = [tuple(r) for r in rows]
+        if not tagged_ids and not arg and not has_mention:
+            # plain "ยกเลิกโอ": cancel the whole round for today
+            conn.execute("DELETE FROM ot_signups WHERE group_id = ? AND work_date = ?",
+                         (group_id, today.isoformat()))
+            conn.commit()
+            set_setting(_ot_cancelled_key(group_id, today), bkk_now().isoformat())
+            set_setting(_ot_closed_key(group_id, today), bkk_now().isoformat())
+            th = f"{today.day:02d}/{today.month:02d}/{today.year + 543}"
+            text = (f"{{all}} ❌ ยกเลิก OT วันนี้ ({th}) แล้วค่ะ\n"
+                    f"ไม่ต้องลงชื่อ และไม่ได้สั่งข้าวกล่องนะคะ"
+                    + (f" (ล้างรายชื่อที่ลงไว้ {len(rows)} คนแล้ว)" if rows else ""))
+            _line_post(LINE_REPLY_URL, {"replyToken": event.reply_token,
+                                        "messages": [_all_text(text)]})
+            return
+        # remove specific people
+        targets = set(tagged_ids)
+        if arg:
+            wanted = [w.strip().lstrip("@") for w in re.split(r"[,\n]+", arg) if w.strip().lstrip("@")]
+            for w in wanted:
+                wn = _norm_name(w)
+                for uid, name in rows:
+                    if wn and (wn == _norm_name(name) or wn in _norm_name(name)):
+                        targets.add(uid)
+        removed = [name for uid, name in rows if uid in targets]
+        if removed:
+            conn.executemany("DELETE FROM ot_signups WHERE group_id = ? AND work_date = ? AND user_id = ?",
+                             [(group_id, today.isoformat(), uid) for uid in targets])
+            conn.commit()
+    finally:
+        conn.close()
+    if not removed:
+        reply(event.reply_token, "ไม่พบชื่อนี้ในรายชื่อ OT วันนี้ค่ะ (พิมพ์ \"สรุปโอ\" เพื่อดูรายชื่อ)")
+        return
+    left = _ot_rows(group_id, today)
+    reply(event.reply_token,
+          f"✓ เอาชื่อออกจาก OT วันนี้แล้วค่ะ: {', '.join(removed)}\n"
+          f"🍱 สรุปใหม่: รวม {len(left)} คน · ข้าวกล่อง {len(left)} กล่อง\n\n{_ot_names_block(left)}")
 
 def handle_ot_close(event, group_id):
     """Owner/admin "ปิดโอ": close today's sign-up in this group now and post
@@ -4574,6 +4648,9 @@ def handle_postback(event):
         return
     # after the deadline (or "ปิดโอ") the same day, sign-ups are still taken
     # as late additions and the bot replies with the updated summary
+    if ot_is_cancelled(group_id, work_date):
+        reply(event.reply_token, f"OT วันที่ {work_date.day}/{work_date.month} ยกเลิกแล้วค่ะ ไม่ต้องลงชื่อนะคะ")
+        return
     late = not ot_is_open(work_date, group_id=group_id)
     if late and work_date != bkk_today():
         reply(event.reply_token, f"ปิดรับลงชื่อ OT ของวันที่ {work_date.day}/{work_date.month} แล้วค่ะ "
