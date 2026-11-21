@@ -891,8 +891,12 @@ def handle_text(event):
     # shortcut reply: "AR-337 ตรวจแล้ว เหลือแก้รอยต่อฝ้า" saves a reply to
     # that posted document silently (no message back, to save LINE quota).
     # Doesn't return - a reply that also tags someone is still tracked below.
+    # @mentions are removed first, so a reply that opens by tagging an admin
+    # ("@Tok ...\nST-821 SN&FP ไม่มีงาน\n...") is still read as doc replies.
     try:
-        record_group_reply_shortcut(group_id, source.user_id, text)
+        record_group_reply_shortcut(group_id, source.user_id,
+                                    strip_mentions(event.message.text,
+                                                   getattr(event.message, "mention", None)))
     except Exception:
         app.logger.exception("group reply shortcut failed")
 
@@ -1825,6 +1829,31 @@ def split_code_lines(text):
         else:
             return []
     return [(c, t) for c, t in out]
+
+def strip_mentions(raw_text, mention=None):
+    """Removes @mention text (by LINE's UTF-16 index/length) and any leading
+    lines that still start with "@" (e.g. a mention LINE sent without a range),
+    so a reply that opens by tagging someone parses like an untagged one."""
+    raw_text = raw_text or ""
+    spans = []
+    for m in (getattr(mention, "mentionees", None) or []) if mention else []:
+        idx, length = getattr(m, "index", None), getattr(m, "length", None)
+        if idx is not None and length is not None:
+            spans.append((utf16_index_to_py(raw_text, idx),
+                          utf16_index_to_py(raw_text, idx + length)))
+    for start, end in sorted(spans, reverse=True):
+        raw_text = raw_text[:start] + raw_text[end:]
+    lines = raw_text.splitlines()
+    while lines and (not lines[0].strip() or lines[0].lstrip().startswith("@")):
+        lines.pop(0)
+    # a tagged message may also carry a short greeting/leftover before the
+    # list ("รบกวนตรวจครับ"); when a later line starts with a doc code, drop
+    # the lines before it. Only codes actually posted are saved anyway.
+    if spans or (raw_text or "").lstrip().startswith("@"):
+        first = next((i for i, ln in enumerate(lines) if CODE_LINE_RE.match(ln)), None)
+        if first:
+            lines = lines[first:]
+    return "\n".join(lines).strip()
 
 def record_group_reply_shortcut(group_id, user_id, text):
     """Returns True when the text was saved as a reply. Only codes that were
